@@ -1,0 +1,8 @@
+{
+  "id": "splitscreen",
+  "name": "Split Screen",
+  "version": "1.0.0",
+  "private": false,
+  "settings": { "html": "settings.html" },
+  "script": "screen.js"
+}
