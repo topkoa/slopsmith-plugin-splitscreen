@@ -75,8 +75,8 @@
     }
 
     function applyLayoutStyle(container, layoutKey) {
-        const cfg = LAYOUTS[layoutKey];
-        container.style.cssText = 'position:absolute;top:0;left:0;right:0;z-index:3;display:flex;';
+        container.style.cssText =
+            'position:absolute;top:0;left:0;right:0;bottom:0;z-index:3;display:flex;';
         if (layoutKey === 'top-bottom') {
             container.style.flexDirection = 'column';
         } else if (layoutKey === 'left-right') {
@@ -85,7 +85,6 @@
             container.style.flexDirection = 'row';
             container.style.flexWrap = 'wrap';
         }
-        // Height is set in resize()
     }
 
     function createPanel(index, container, layoutKey) {
@@ -143,8 +142,7 @@
         if (!wrap || !panels.length) return;
         const controls = document.getElementById('player-controls');
         const controlsH = controls ? controls.offsetHeight : 50;
-        const totalH = document.documentElement.clientHeight - controlsH;
-        wrap.style.height = totalH + 'px';
+        wrap.style.bottom = controlsH + 'px';
 
         for (const p of panels) {
             const rect = p.panelDiv.getBoundingClientRect();
@@ -225,9 +223,11 @@
             initPanel(panel, arrDefaults[i]);
         }
 
-        // Hide default highway canvas
+        // Hide default highway canvas, ensure controls stay on top
         const defaultCanvas = document.getElementById('highway');
         if (defaultCanvas) defaultCanvas.style.display = 'none';
+        const controls = document.getElementById('player-controls');
+        if (controls) controls.style.zIndex = '10';
 
         sizeCanvases();
         active = true;
@@ -241,9 +241,11 @@
         teardownPanels();
         active = false;
 
-        // Restore default highway canvas
+        // Restore default highway canvas and controls z-index
         const defaultCanvas = document.getElementById('highway');
         if (defaultCanvas) defaultCanvas.style.display = '';
+        const controls = document.getElementById('player-controls');
+        if (controls) controls.style.zIndex = '';
 
         updateBtn();
         stopTimeSync();
