@@ -430,6 +430,7 @@
         panel.lyricsPane.el.style.bottom = (panel.bar.offsetHeight || 28) + 'px';
         panel.lyricsPane.connect(currentFilename, 0);
         panel.lyricsMode = true;
+        panel.select.value = LYRICS_VALUE;
         panel.arrName.textContent = 'Lyrics';
         savePanelPrefs();
     }
