@@ -290,8 +290,9 @@
     }
 
     function applyLayoutStyle(container, layoutKey) {
+        // Note: bottom is set dynamically by sizeCanvases() to leave room for global controls
         container.style.cssText =
-            'position:absolute;top:0;left:0;right:0;bottom:0;z-index:3;display:flex;';
+            'position:absolute;top:0;left:0;right:0;z-index:3;display:flex;';
         if (layoutKey === 'top-bottom') {
             container.style.flexDirection = 'column';
         } else if (layoutKey === 'left-right') {
