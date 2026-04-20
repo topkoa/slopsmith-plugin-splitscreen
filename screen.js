@@ -835,8 +835,12 @@
         await _play(f, a);
 
         currentFilename = f;
-        // Wait for song_info to arrive so we have the arrangement list
+
+        // Try to grab arrangements eagerly via _onReady, but also poll as
+        // a fallback — async plugins (e.g. 3dhighway) can cause the 'ready'
+        // WS message to fire before _onReady is set, so we can't rely on it.
         const origOnReady = highway._onReady;
+        let handled = false;
         highway._onReady = () => {
             const info = highway.getSongInfo();
             if (info && info.arrangements) {
@@ -845,10 +849,29 @@
             if (origOnReady) origOnReady();
             highway._onReady = null;
 
-            if (alwaysSplit || (wasActive && autoReactivate)) {
+            if (!handled && (alwaysSplit || (wasActive && autoReactivate))) {
+                handled = true;
                 startSplitScreen();
             }
         };
+
+        // Fallback: poll for song info in case _onReady was missed
+        if (alwaysSplit || (wasActive && autoReactivate)) {
+            let attempts = 0;
+            const poll = setInterval(() => {
+                attempts++;
+                if (handled || attempts > 30) { clearInterval(poll); return; }
+                const info = highway.getSongInfo();
+                if (info && info.arrangements && info.arrangements.length) {
+                    clearInterval(poll);
+                    if (!handled) {
+                        handled = true;
+                        arrangements = info.arrangements;
+                        startSplitScreen();
+                    }
+                }
+            }, 200);
+        }
 
         injectBtn();
     };
