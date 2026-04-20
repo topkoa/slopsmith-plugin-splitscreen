@@ -16,9 +16,12 @@
 
     const OFF_CLASS = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition';
     const ON_CLASS  = 'px-3 py-1.5 bg-blue-900/50 hover:bg-blue-900/60 rounded-lg text-xs text-blue-300 transition';
+    const STORAGE_KEY = 'splitscreenPanelPrefs';
 
     let active = false;
     let layout = localStorage.getItem('splitscreenLayout') || 'top-bottom';
+    let autoReactivate = localStorage.getItem('splitscreenAutoReactivate') === 'true';
+    let alwaysSplit = localStorage.getItem('splitscreenAlwaysSplit') === 'true';
     let panels = [];       // { hw, canvas, ws, arrIndex, controls }
     let wrap = null;
     let currentFilename = null;
@@ -33,6 +36,51 @@
             localStorage.setItem('splitscreenLayout', layout);
             if (active) rebuildLayout();
         });
+    }
+
+    const autoReactivateCheckbox = document.getElementById('splitscreen-auto-reactivate');
+    if (autoReactivateCheckbox) {
+        autoReactivateCheckbox.checked = autoReactivate;
+        autoReactivateCheckbox.addEventListener('change', () => {
+            autoReactivate = autoReactivateCheckbox.checked;
+            localStorage.setItem('splitscreenAutoReactivate', autoReactivate);
+        });
+    }
+
+    const alwaysSplitCheckbox = document.getElementById('splitscreen-always-split');
+    if (alwaysSplitCheckbox) {
+        alwaysSplitCheckbox.checked = alwaysSplit;
+        alwaysSplitCheckbox.addEventListener('change', () => {
+            alwaysSplit = alwaysSplitCheckbox.checked;
+            localStorage.setItem('splitscreenAlwaysSplit', alwaysSplit);
+        });
+    }
+
+    // ── Panel preference persistence ──
+    function savePanelPrefs() {
+        const prefs = panels.map(p => ({
+            arrName: arrangements[p.arrIndex]?.name || '',
+            lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
+            inverted: p.hw.getInverted(),
+        }));
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
+    }
+
+    function loadPanelPrefs() {
+        try {
+            return JSON.parse(localStorage.getItem(STORAGE_KEY)) || null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function resolveArrIndex(arrName) {
+        if (!arrName) return -1;
+        const lower = arrName.toLowerCase();
+        for (let i = 0; i < arrangements.length; i++) {
+            if ((arrangements[i].name || '').toLowerCase() === lower) return i;
+        }
+        return -1;
     }
 
     // ── Helpers ──
@@ -180,9 +228,17 @@
     }
 
     // ── Panel lifecycle ──
-    function initPanel(panel, arrIndex) {
+    function initPanel(panel, arrIndex, prefs) {
         panel.arrIndex = arrIndex;
         panel.hw.init(panel.canvas);
+
+        // Apply saved preferences
+        if (prefs) {
+            if (prefs.inverted !== undefined) panel.hw.setInverted(prefs.inverted);
+            if (prefs.lyrics !== undefined && typeof panel.hw.setLyricsVisible === 'function') {
+                panel.hw.setLyricsVisible(prefs.lyrics);
+            }
+        }
 
         // Populate arrangement dropdown
         panel.select.innerHTML = '';
@@ -199,6 +255,7 @@
         panel.select.onchange = () => {
             const newIdx = parseInt(panel.select.value);
             switchPanelArrangement(panel, newIdx);
+            savePanelPrefs();
         };
 
         // Per-panel invert toggle
@@ -207,6 +264,7 @@
             const on = !panel.hw.getInverted();
             panel.hw.setInverted(on);
             panel.updateInvertStyle(on);
+            savePanelPrefs();
         };
 
         // Per-panel lyrics toggle (uses highway factory's per-instance showLyrics)
@@ -217,6 +275,7 @@
                 const on = !panel.hw.getLyricsVisible();
                 panel.hw.setLyricsVisible(on);
                 panel.updateLyricsStyle(on);
+                savePanelPrefs();
             };
         } else {
             panel.lyricsBtn.disabled = true;
@@ -325,26 +384,49 @@
     // ── Main toggle ──
     function rebuildLayout() {
         const wasActive = active;
-        const oldArrangements = panels.map(p => p.arrIndex);
+        const savedPrefs = wasActive ? captureCurrentPrefs() : null;
         teardownPanels();
-        if (wasActive) startSplitScreen(oldArrangements);
+        if (wasActive) startSplitScreen(null, savedPrefs);
     }
 
-    function startSplitScreen(existingArrangements) {
+    function captureCurrentPrefs() {
+        return panels.map(p => ({
+            arrName: arrangements[p.arrIndex]?.name || '',
+            lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
+            inverted: p.hw.getInverted(),
+        }));
+    }
+
+    function startSplitScreen(existingArrangements, savedPrefs) {
         const info = highway.getSongInfo();
         if (info && info.arrangements) {
             arrangements = info.arrangements;
         }
         if (arrangements.length === 0) return;
 
+        // If no explicit arrangements or prefs passed, try loading from storage
+        if (!existingArrangements && !savedPrefs) {
+            savedPrefs = loadPanelPrefs();
+        }
+
         const cfg = LAYOUTS[layout];
         const container = createWrap();
         applyLayoutStyle(container, layout);
 
         // Determine arrangements for each panel
-        const arrDefaults = existingArrangements && existingArrangements.length >= cfg.panels
-            ? existingArrangements.slice(0, cfg.panels)
-            : getDefaultArrangements(cfg.panels);
+        let arrDefaults;
+        if (existingArrangements && existingArrangements.length >= cfg.panels) {
+            arrDefaults = existingArrangements.slice(0, cfg.panels);
+        } else if (savedPrefs && savedPrefs.length > 0) {
+            arrDefaults = [];
+            for (let i = 0; i < cfg.panels; i++) {
+                const pref = savedPrefs[i % savedPrefs.length];
+                const idx = pref ? resolveArrIndex(pref.arrName) : -1;
+                arrDefaults.push(idx >= 0 ? idx : getDefaultArrangements(1)[0]);
+            }
+        } else {
+            arrDefaults = getDefaultArrangements(cfg.panels);
+        }
 
         for (let i = 0; i < cfg.panels; i++) {
             const parts = createPanel(i, container, layout);
@@ -368,7 +450,8 @@
             };
 
             panels.push(panel);
-            initPanel(panel, arrDefaults[i]);
+            const panelPrefs = savedPrefs ? savedPrefs[i % savedPrefs.length] : null;
+            initPanel(panel, arrDefaults[i], panelPrefs);
         }
 
         // Hide default highway canvas, ensure controls stay on top and at bottom
@@ -383,12 +466,14 @@
         sizeCanvases();
         active = true;
         updateBtn();
+        savePanelPrefs();
 
         // Hook into the time sync loop
         startTimeSync();
     }
 
     function stopSplitScreen() {
+        savePanelPrefs();
         teardownPanels();
         active = false;
 
@@ -498,7 +583,7 @@
     // ── Hook into playSong ──
     const _play = window.playSong;
     window.playSong = async function (f, a) {
-        // Teardown any active split screen before playing new song
+        const wasActive = active;
         if (active) stopSplitScreen();
         await _play(f, a);
 
@@ -512,6 +597,10 @@
             }
             if (origOnReady) origOnReady();
             highway._onReady = null;
+
+            if (alwaysSplit || (wasActive && autoReactivate)) {
+                startSplitScreen();
+            }
         };
 
         injectBtn();
