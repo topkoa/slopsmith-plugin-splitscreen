@@ -708,6 +708,7 @@
         if (defaultCanvas) defaultCanvas.style.display = 'none';
         const controls = document.getElementById('player-controls');
         if (controls) {
+            controls.style.position = 'relative';  // Required for z-index to work
             controls.style.zIndex = '10';
             controls.style.marginTop = 'auto';
         }
