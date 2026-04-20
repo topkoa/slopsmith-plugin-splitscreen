@@ -331,6 +331,10 @@
     }
 
     function startSplitScreen(existingArrangements) {
+        const info = highway.getSongInfo();
+        if (info && info.arrangements) {
+            arrangements = info.arrangements;
+        }
         if (arrangements.length === 0) return;
 
         const cfg = LAYOUTS[layout];
