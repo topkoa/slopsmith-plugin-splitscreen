@@ -371,11 +371,14 @@
             initPanel(panel, arrDefaults[i]);
         }
 
-        // Hide default highway canvas, ensure controls stay on top
+        // Hide default highway canvas, ensure controls stay on top and at bottom
         const defaultCanvas = document.getElementById('highway');
         if (defaultCanvas) defaultCanvas.style.display = 'none';
         const controls = document.getElementById('player-controls');
-        if (controls) controls.style.zIndex = '10';
+        if (controls) {
+            controls.style.zIndex = '10';
+            controls.style.marginTop = 'auto';
+        }
 
         sizeCanvases();
         active = true;
@@ -393,7 +396,10 @@
         const defaultCanvas = document.getElementById('highway');
         if (defaultCanvas) defaultCanvas.style.display = '';
         const controls = document.getElementById('player-controls');
-        if (controls) controls.style.zIndex = '';
+        if (controls) {
+            controls.style.zIndex = '';
+            controls.style.marginTop = '';
+        }
 
         updateBtn();
         stopTimeSync();
