@@ -17,6 +17,7 @@
     const OFF_CLASS = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition';
     const ON_CLASS  = 'px-3 py-1.5 bg-blue-900/50 hover:bg-blue-900/60 rounded-lg text-xs text-blue-300 transition';
     const STORAGE_KEY = 'splitscreenPanelPrefs';
+    const LYRICS_VALUE = '__lyrics__';
 
     let active = false;
     let layout = localStorage.getItem('splitscreenLayout') || 'top-bottom';
@@ -59,7 +60,7 @@
     // ── Panel preference persistence ──
     function savePanelPrefs() {
         const prefs = panels.map(p => ({
-            arrName: arrangements[p.arrIndex]?.name || '',
+            arrName: p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
             inverted: p.hw.getInverted(),
         }));
@@ -75,7 +76,7 @@
     }
 
     function resolveArrIndex(arrName) {
-        if (!arrName) return -1;
+        if (!arrName || arrName === LYRICS_VALUE) return -1;
         const lower = arrName.toLowerCase();
         for (let i = 0; i < arrangements.length; i++) {
             if ((arrangements[i].name || '').toLowerCase() === lower) return i;
@@ -110,6 +111,172 @@
         }
         return defaults;
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  Lyrics-only pane renderer
+    // ══════════════════════════════════════════════════════════════════════
+
+    function createLyricsPane(container) {
+        const el = document.createElement('div');
+        el.className = 'splitscreen-lyrics-pane';
+        el.style.cssText =
+            'position:absolute;top:0;left:0;right:0;bottom:0;' +
+            'display:flex;flex-direction:column;justify-content:center;align-items:center;' +
+            'background:#08080e;padding:24px;overflow:hidden;';
+        container.appendChild(el);
+
+        let lyrics = [];
+        let lines = null;
+        let ws = null;
+        let raf = null;
+
+        function parseLyrics(data) {
+            lyrics = data;
+            lines = null;
+            if (!lyrics.length) return;
+
+            const result = [];
+            let line = null, word = null;
+
+            const flushWord = () => {
+                if (word && word.length) line.words.push(word);
+                word = null;
+            };
+            const flushLine = () => {
+                flushWord();
+                if (line && line.words.length) result.push(line);
+                line = null;
+            };
+
+            for (let i = 0; i < lyrics.length; i++) {
+                const l = lyrics[i];
+                const raw = l.w || '';
+                const endsLine = raw.endsWith('+');
+                const continuesWord = raw.endsWith('-');
+
+                if (line && i > 0) {
+                    const prev = lyrics[i - 1];
+                    if (l.t - (prev.t + prev.d) > 4.0) flushLine();
+                }
+
+                if (!line) line = { words: [], start: l.t, end: l.t + l.d };
+                if (!word) word = [];
+
+                word.push(l);
+                line.end = Math.max(line.end, l.t + l.d);
+
+                if (!continuesWord) flushWord();
+                if (endsLine) flushLine();
+            }
+            flushLine();
+            lines = result;
+        }
+
+        function syllableText(s) {
+            const t = s.w || '';
+            return (t.endsWith('+') || t.endsWith('-')) ? t.slice(0, -1) : t;
+        }
+
+        function renderLine(lineData, currentTime) {
+            const frag = document.createDocumentFragment();
+            for (const word of lineData.words) {
+                for (const syl of word) {
+                    const span = document.createElement('span');
+                    span.textContent = syllableText(syl);
+                    const active = currentTime >= syl.t && currentTime < syl.t + syl.d;
+                    const past = currentTime >= syl.t + syl.d;
+                    if (active) {
+                        span.style.color = '#60a0ff';
+                        span.style.textShadow = '0 0 12px rgba(96,160,255,0.5)';
+                    } else if (past) {
+                        span.style.color = '#9ca3af';
+                    } else {
+                        span.style.color = '#555';
+                    }
+                    frag.appendChild(span);
+                }
+                const space = document.createDocumentFragment();
+                space.appendChild(document.createTextNode(' '));
+                frag.appendChild(space);
+            }
+            return frag;
+        }
+
+        function render() {
+            raf = requestAnimationFrame(render);
+            if (!lines || !lines.length) {
+                if (!el.dataset.empty) {
+                    el.innerHTML = '<span style="color:#555;font-style:italic">No lyrics</span>';
+                    el.dataset.empty = '1';
+                }
+                return;
+            }
+            delete el.dataset.empty;
+
+            const audio = document.getElementById('audio');
+            const t = audio ? audio.currentTime : 0;
+
+            let currentIdx = -1;
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].start <= t) currentIdx = i;
+                else break;
+            }
+            if (currentIdx === -1) {
+                if (lines[0].start - t > 3.0) {
+                    el.innerHTML = '';
+                    return;
+                }
+                currentIdx = 0;
+            }
+
+            const currentLine = lines[currentIdx];
+            const nextLine = lines[currentIdx + 1] || null;
+            const gapToNext = nextLine ? (nextLine.start - currentLine.end) : Infinity;
+
+            if (t > currentLine.end + 1.0 && gapToNext > 4.0) {
+                el.innerHTML = '';
+                return;
+            }
+
+            el.innerHTML = '';
+
+            const curDiv = document.createElement('div');
+            curDiv.style.cssText = 'font-size:clamp(20px, 4vw, 48px);font-weight:600;text-align:center;line-height:1.4;transition:opacity 0.3s;';
+            curDiv.appendChild(renderLine(currentLine, t));
+            el.appendChild(curDiv);
+
+            if (nextLine && gapToNext <= 4.0) {
+                const nextDiv = document.createElement('div');
+                nextDiv.style.cssText = 'font-size:clamp(16px, 3vw, 36px);font-weight:400;text-align:center;line-height:1.4;margin-top:16px;color:#444;';
+                nextDiv.appendChild(renderLine(nextLine, t));
+                el.appendChild(nextDiv);
+            }
+        }
+
+        function connect(filename, arrangement) {
+            destroy();
+            ws = new WebSocket(getWsUrl(filename, arrangement));
+            ws.onmessage = (ev) => {
+                const msg = JSON.parse(ev.data);
+                if (msg.type === 'lyrics') parseLyrics(msg.data);
+            };
+            ws.onerror = () => {};
+            ws.onclose = () => { ws = null; };
+            raf = requestAnimationFrame(render);
+        }
+
+        function destroy() {
+            if (raf) { cancelAnimationFrame(raf); raf = null; }
+            if (ws) { ws.close(); ws = null; }
+            lyrics = [];
+            lines = null;
+            el.innerHTML = '';
+        }
+
+        return { el, connect, destroy };
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
 
     // ── Layout ──
     function createWrap() {
@@ -224,37 +391,106 @@
         const controls = document.getElementById('player-controls');
         const controlsH = controls ? controls.offsetHeight : 50;
         wrap.style.bottom = controlsH + 'px';
-        for (const p of panels) p.hw.resize();
+        for (const p of panels) {
+            if (!p.lyricsMode) p.hw.resize();
+        }
     }
 
     // ── Panel lifecycle ──
-    function initPanel(panel, arrIndex, prefs) {
+    function populateSelect(panel, arrIndex) {
+        panel.select.innerHTML = '';
+        arrangements.forEach((a, i) => {
+            const opt = document.createElement('option');
+            opt.value = i;
+            opt.textContent = a.name || `Arr ${i}`;
+            if (i === arrIndex && !panel.lyricsMode) opt.selected = true;
+            panel.select.appendChild(opt);
+        });
+        const lyricsOpt = document.createElement('option');
+        lyricsOpt.value = LYRICS_VALUE;
+        lyricsOpt.textContent = 'Lyrics';
+        if (panel.lyricsMode) lyricsOpt.selected = true;
+        panel.select.appendChild(lyricsOpt);
+    }
+
+    function enterLyricsMode(panel) {
+        if (panel.lyricsMode) return;
+
+        // Tear down highway / tab if active
+        if (panel.tabActive) togglePanelTab(panel);
+        panel.hw.stop();
+        panel.canvas.style.display = 'none';
+
+        // Hide highway-specific buttons
+        panel.invertBtn.style.display = 'none';
+        panel.lyricsBtn.style.display = 'none';
+        panel.tabBtn.style.display = 'none';
+
+        panel.lyricsPane = createLyricsPane(panel.panelDiv);
+        panel.lyricsPane.el.style.bottom = (panel.bar.offsetHeight || 28) + 'px';
+        panel.lyricsPane.connect(currentFilename, 0);
+        panel.lyricsMode = true;
+        panel.select.value = LYRICS_VALUE;
+        panel.arrName.textContent = 'Lyrics';
+        savePanelPrefs();
+    }
+
+    function exitLyricsMode(panel, arrIndex) {
+        if (!panel.lyricsMode) return;
+
+        if (panel.lyricsPane) {
+            panel.lyricsPane.destroy();
+            panel.lyricsPane.el.remove();
+            panel.lyricsPane = null;
+        }
+
+        panel.canvas.style.display = '';
+        panel.invertBtn.style.display = '';
+        panel.lyricsBtn.style.display = '';
+        panel.tabBtn.style.display = '';
+        panel.lyricsMode = false;
+
+        panel.hw.init(panel.canvas);
+        panel.hw.resize();
         panel.arrIndex = arrIndex;
+        panel.arrName.textContent = arrangements[arrIndex]?.name || '';
+        panel.hw.connect(getWsUrl(currentFilename, arrIndex), { onSongInfo: () => {} });
+        savePanelPrefs();
+    }
+
+    function initPanel(panel, arrIndex, prefs) {
+        const isLyricsMode = prefs?.arrName === LYRICS_VALUE;
+        panel.arrIndex = isLyricsMode ? 0 : arrIndex;
+        panel.lyricsMode = false;
+        panel.lyricsPane = null;
+
         panel.hw.init(panel.canvas);
 
         // Apply saved preferences
-        if (prefs) {
+        if (prefs && !isLyricsMode) {
             if (prefs.inverted !== undefined) panel.hw.setInverted(prefs.inverted);
             if (prefs.lyrics !== undefined && typeof panel.hw.setLyricsVisible === 'function') {
                 panel.hw.setLyricsVisible(prefs.lyrics);
             }
         }
 
-        // Populate arrangement dropdown
-        panel.select.innerHTML = '';
-        arrangements.forEach((a, i) => {
-            const opt = document.createElement('option');
-            opt.value = i;
-            opt.textContent = a.name || `Arr ${i}`;
-            if (i === arrIndex) opt.selected = true;
-            panel.select.appendChild(opt);
-        });
+        // Populate arrangement dropdown (includes Lyrics option)
+        populateSelect(panel, arrIndex);
 
-        panel.arrName.textContent = arrangements[arrIndex]?.name || '';
+        panel.arrName.textContent = isLyricsMode ? 'Lyrics' : (arrangements[arrIndex]?.name || '');
 
         panel.select.onchange = () => {
-            const newIdx = parseInt(panel.select.value);
-            switchPanelArrangement(panel, newIdx);
+            const val = panel.select.value;
+            if (val === LYRICS_VALUE) {
+                enterLyricsMode(panel);
+            } else {
+                const newIdx = parseInt(val);
+                if (panel.lyricsMode) {
+                    exitLyricsMode(panel, newIdx);
+                } else {
+                    switchPanelArrangement(panel, newIdx);
+                }
+            }
             savePanelPrefs();
         };
 
@@ -293,11 +529,15 @@
             panel.tabBtn.style.opacity = '0.4';
         }
 
-        // Connect WebSocket. Pass an empty onSongInfo so core skips its
-        // default writes to shared HUD / audio / arrangement dropdown
-        // — otherwise every panel's song_info clobbers the main view.
-        // See byrongamatos/slopsmith#27.
-        panel.hw.connect(getWsUrl(currentFilename, arrIndex), { onSongInfo: () => {} });
+        if (isLyricsMode) {
+            enterLyricsMode(panel);
+        } else {
+            // Connect WebSocket. Pass an empty onSongInfo so core skips its
+            // default writes to shared HUD / audio / arrangement dropdown
+            // — otherwise every panel's song_info clobbers the main view.
+            // See byrongamatos/slopsmith#27.
+            panel.hw.connect(getWsUrl(currentFilename, arrIndex), { onSongInfo: () => {} });
+        }
     }
 
     async function togglePanelTab(panel) {
@@ -368,6 +608,10 @@
 
     function teardownPanels() {
         for (const p of panels) {
+            if (p.lyricsPane) {
+                p.lyricsPane.destroy();
+                p.lyricsPane = null;
+            }
             if (p.tabInstance) {
                 try { p.tabInstance.destroy(); } catch (_) {}
                 p.tabInstance = null;
@@ -391,7 +635,7 @@
 
     function captureCurrentPrefs() {
         return panels.map(p => ({
-            arrName: arrangements[p.arrIndex]?.name || '',
+            arrName: p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
             inverted: p.hw.getInverted(),
         }));
@@ -421,8 +665,12 @@
             arrDefaults = [];
             for (let i = 0; i < cfg.panels; i++) {
                 const pref = savedPrefs[i % savedPrefs.length];
-                const idx = pref ? resolveArrIndex(pref.arrName) : -1;
-                arrDefaults.push(idx >= 0 ? idx : getDefaultArrangements(1)[0]);
+                if (pref && pref.arrName === LYRICS_VALUE) {
+                    arrDefaults.push(0);
+                } else {
+                    const idx = pref ? resolveArrIndex(pref.arrName) : -1;
+                    arrDefaults.push(idx >= 0 ? idx : getDefaultArrangements(1)[0]);
+                }
             }
         } else {
             arrDefaults = getDefaultArrangements(cfg.panels);
@@ -508,7 +756,7 @@
             if (!audio || !active) return;
             const t = audio.currentTime;
             for (const p of panels) {
-                p.hw.setTime(t);
+                if (!p.lyricsMode) p.hw.setTime(t);
             }
         }, 1000 / 60);
     }
@@ -588,8 +836,12 @@
         await _play(f, a);
 
         currentFilename = f;
-        // Wait for song_info to arrive so we have the arrangement list
+
+        // Try to grab arrangements eagerly via _onReady, but also poll as
+        // a fallback — async plugins (e.g. 3dhighway) can cause the 'ready'
+        // WS message to fire before _onReady is set, so we can't rely on it.
         const origOnReady = highway._onReady;
+        let handled = false;
         highway._onReady = () => {
             const info = highway.getSongInfo();
             if (info && info.arrangements) {
@@ -598,10 +850,29 @@
             if (origOnReady) origOnReady();
             highway._onReady = null;
 
-            if (alwaysSplit || (wasActive && autoReactivate)) {
+            if (!handled && (alwaysSplit || (wasActive && autoReactivate))) {
+                handled = true;
                 startSplitScreen();
             }
         };
+
+        // Fallback: poll for song info in case _onReady was missed
+        if (alwaysSplit || (wasActive && autoReactivate)) {
+            let attempts = 0;
+            const poll = setInterval(() => {
+                attempts++;
+                if (handled || attempts > 30) { clearInterval(poll); return; }
+                const info = highway.getSongInfo();
+                if (info && info.arrangements && info.arrangements.length) {
+                    clearInterval(poll);
+                    if (!handled) {
+                        handled = true;
+                        arrangements = info.arrangements;
+                        startSplitScreen();
+                    }
+                }
+            }, 200);
+        }
 
         injectBtn();
     };
