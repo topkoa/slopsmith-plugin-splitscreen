@@ -18,6 +18,7 @@
     const ON_CLASS  = 'px-3 py-1.5 bg-blue-900/50 hover:bg-blue-900/60 rounded-lg text-xs text-blue-300 transition';
     const STORAGE_KEY = 'splitscreenPanelPrefs';
     const LYRICS_VALUE = '__lyrics__';
+    const JUMPING_TAB_VALUE = '__jumping_tab__';
 
     let active = false;
     let layout = localStorage.getItem('splitscreenLayout') || 'top-bottom';
@@ -60,7 +61,7 @@
     // ── Panel preference persistence ──
     function savePanelPrefs() {
         const prefs = panels.map(p => ({
-            arrName: p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
+            arrName: p.jumpingTabMode ? JUMPING_TAB_VALUE : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
             inverted: p.hw.getInverted(),
         }));
@@ -76,7 +77,7 @@
     }
 
     function resolveArrIndex(arrName) {
-        if (!arrName || arrName === LYRICS_VALUE) return -1;
+        if (!arrName || arrName === LYRICS_VALUE || arrName === JUMPING_TAB_VALUE) return -1;
         const lower = arrName.toLowerCase();
         for (let i = 0; i < arrangements.length; i++) {
             if ((arrangements[i].name || '').toLowerCase() === lower) return i;
@@ -393,7 +394,11 @@
         const controlsH = controls ? controls.offsetHeight : 50;
         wrap.style.bottom = controlsH + 'px';
         for (const p of panels) {
-            if (!p.lyricsMode) p.hw.resize();
+            if (p.jumpingTabMode && p.jumpingTabPane) {
+                p.jumpingTabPane.resize();
+            } else if (!p.lyricsMode) {
+                p.hw.resize();
+            }
         }
     }
 
@@ -412,12 +417,20 @@
         lyricsOpt.textContent = 'Lyrics';
         if (panel.lyricsMode) lyricsOpt.selected = true;
         panel.select.appendChild(lyricsOpt);
+
+        if (typeof window.createJumpingTabPane === 'function') {
+            const jtOpt = document.createElement('option');
+            jtOpt.value = JUMPING_TAB_VALUE;
+            jtOpt.textContent = 'Jumping Tab';
+            if (panel.jumpingTabMode) jtOpt.selected = true;
+            panel.select.appendChild(jtOpt);
+        }
     }
 
     function enterLyricsMode(panel) {
         if (panel.lyricsMode) return;
 
-        // Tear down highway / tab if active
+        if (panel.jumpingTabMode) exitJumpingTabMode(panel, panel.arrIndex);
         if (panel.tabActive) togglePanelTab(panel);
         panel.hw.stop();
         panel.canvas.style.display = 'none';
@@ -459,16 +472,75 @@
         savePanelPrefs();
     }
 
+    function enterJumpingTabMode(panel) {
+        if (panel.jumpingTabMode) return;
+
+        if (panel.lyricsMode) exitLyricsMode(panel, panel.arrIndex);
+        if (panel.tabActive) togglePanelTab(panel);
+        panel.hw.stop();
+        panel.canvas.style.display = 'none';
+
+        panel.invertBtn.style.display = 'none';
+        panel.lyricsBtn.style.display = 'none';
+        panel.tabBtn.style.display = 'none';
+
+        const jtContainer = document.createElement('div');
+        jtContainer.style.cssText =
+            'position:absolute;top:0;left:0;right:0;bottom:' +
+            ((panel.bar.offsetHeight || 28) + 'px') +
+            ';overflow:hidden;background:#0f1420;z-index:2;';
+        panel.panelDiv.appendChild(jtContainer);
+
+        const pane = window.createJumpingTabPane({ container: jtContainer });
+        pane.connect(currentFilename, panel.arrIndex);
+        panel.jumpingTabMode = true;
+        panel.jumpingTabPane = pane;
+        panel.jumpingTabContainer = jtContainer;
+        panel.select.value = JUMPING_TAB_VALUE;
+        panel.arrName.textContent = 'Jumping Tab';
+        savePanelPrefs();
+    }
+
+    function exitJumpingTabMode(panel, arrIndex) {
+        if (!panel.jumpingTabMode) return;
+
+        if (panel.jumpingTabPane) {
+            panel.jumpingTabPane.destroy();
+            panel.jumpingTabPane = null;
+        }
+        if (panel.jumpingTabContainer) {
+            panel.jumpingTabContainer.remove();
+            panel.jumpingTabContainer = null;
+        }
+
+        panel.canvas.style.display = '';
+        panel.invertBtn.style.display = '';
+        panel.lyricsBtn.style.display = '';
+        panel.tabBtn.style.display = '';
+        panel.jumpingTabMode = false;
+
+        panel.hw.init(panel.canvas);
+        panel.hw.resize();
+        panel.arrIndex = arrIndex;
+        panel.arrName.textContent = arrangements[arrIndex]?.name || '';
+        panel.hw.connect(getWsUrl(currentFilename, arrIndex), { onSongInfo: () => {} });
+        savePanelPrefs();
+    }
+
     function initPanel(panel, arrIndex, prefs) {
         const isLyricsMode = prefs?.arrName === LYRICS_VALUE;
-        panel.arrIndex = isLyricsMode ? 0 : arrIndex;
+        const isJumpingTabMode = prefs?.arrName === JUMPING_TAB_VALUE;
+        panel.arrIndex = (isLyricsMode || isJumpingTabMode) ? 0 : arrIndex;
         panel.lyricsMode = false;
         panel.lyricsPane = null;
+        panel.jumpingTabMode = false;
+        panel.jumpingTabPane = null;
+        panel.jumpingTabContainer = null;
 
         panel.hw.init(panel.canvas);
 
         // Apply saved preferences
-        if (prefs && !isLyricsMode) {
+        if (prefs && !isLyricsMode && !isJumpingTabMode) {
             if (prefs.inverted !== undefined) panel.hw.setInverted(prefs.inverted);
             if (prefs.lyrics !== undefined && typeof panel.hw.setLyricsVisible === 'function') {
                 panel.hw.setLyricsVisible(prefs.lyrics);
@@ -478,15 +550,19 @@
         // Populate arrangement dropdown (includes Lyrics option)
         populateSelect(panel, arrIndex);
 
-        panel.arrName.textContent = isLyricsMode ? 'Lyrics' : (arrangements[arrIndex]?.name || '');
+        panel.arrName.textContent = isLyricsMode ? 'Lyrics' : isJumpingTabMode ? 'Jumping Tab' : (arrangements[arrIndex]?.name || '');
 
         panel.select.onchange = () => {
             const val = panel.select.value;
-            if (val === LYRICS_VALUE) {
+            if (val === JUMPING_TAB_VALUE) {
+                enterJumpingTabMode(panel);
+            } else if (val === LYRICS_VALUE) {
                 enterLyricsMode(panel);
             } else {
                 const newIdx = parseInt(val);
-                if (panel.lyricsMode) {
+                if (panel.jumpingTabMode) {
+                    exitJumpingTabMode(panel, newIdx);
+                } else if (panel.lyricsMode) {
                     exitLyricsMode(panel, newIdx);
                 } else {
                     switchPanelArrangement(panel, newIdx);
@@ -532,6 +608,8 @@
 
         if (isLyricsMode) {
             enterLyricsMode(panel);
+        } else if (isJumpingTabMode) {
+            enterJumpingTabMode(panel);
         } else {
             // Connect WebSocket. Pass an empty onSongInfo so core skips its
             // default writes to shared HUD / audio / arrangement dropdown
@@ -613,6 +691,10 @@
                 p.lyricsPane.destroy();
                 p.lyricsPane = null;
             }
+            if (p.jumpingTabPane) {
+                p.jumpingTabPane.destroy();
+                p.jumpingTabPane = null;
+            }
             if (p.tabInstance) {
                 try { p.tabInstance.destroy(); } catch (_) {}
                 p.tabInstance = null;
@@ -636,7 +718,7 @@
 
     function captureCurrentPrefs() {
         return panels.map(p => ({
-            arrName: p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
+            arrName: p.jumpingTabMode ? JUMPING_TAB_VALUE : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
             inverted: p.hw.getInverted(),
         }));
@@ -666,7 +748,7 @@
             arrDefaults = [];
             for (let i = 0; i < cfg.panels; i++) {
                 const pref = savedPrefs[i % savedPrefs.length];
-                if (pref && pref.arrName === LYRICS_VALUE) {
+                if (pref && (pref.arrName === LYRICS_VALUE || pref.arrName === JUMPING_TAB_VALUE)) {
                     arrDefaults.push(0);
                 } else {
                     const idx = pref ? resolveArrIndex(pref.arrName) : -1;
@@ -758,7 +840,7 @@
             if (!audio || !active) return;
             const t = audio.currentTime;
             for (const p of panels) {
-                if (!p.lyricsMode) p.hw.setTime(t);
+                if (!p.lyricsMode && !p.jumpingTabMode) p.hw.setTime(t);
             }
         }, 1000 / 60);
     }
