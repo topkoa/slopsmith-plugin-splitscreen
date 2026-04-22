@@ -19,6 +19,8 @@
     const STORAGE_KEY = 'splitscreenPanelPrefs';
     const LYRICS_VALUE = '__lyrics__';
     const JUMPING_TAB_VALUE = '__jumping_tab__';
+    const DETECT_CHANNEL_CYCLE  = ['mono', 'left', 'right'];
+    const DETECT_CHANNEL_LABELS = { mono: 'M', left: 'L', right: 'R' };
 
     let active = false;
     let layout = localStorage.getItem('splitscreenLayout') || 'top-bottom';
@@ -66,6 +68,7 @@
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
             inverted: p.hw.getInverted(),
+            detectChannel: p.detectChannel || 'mono',
         }));
         localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
     }
@@ -379,6 +382,15 @@
         updateTabStyle(false);
         bar.appendChild(tabBtn);
 
+        const detectBtn = makeToggleBtn('Detect');
+        const updateDetectStyle = (on) => styleToggle(detectBtn, on, '#14532d');
+        updateDetectStyle(false);
+        bar.appendChild(detectBtn);
+
+        const channelBtn = makeToggleBtn('M');
+        channelBtn.title = 'Audio channel: Mono / Left / Right';
+        bar.appendChild(channelBtn);
+
         panelDiv.appendChild(bar);
         container.appendChild(panelDiv);
 
@@ -387,6 +399,8 @@
             invertBtn, updateInvertStyle,
             lyricsBtn, updateLyricsStyle,
             tabBtn, updateTabStyle,
+            detectBtn, updateDetectStyle,
+            channelBtn,
         };
     }
 
@@ -625,6 +639,22 @@
             panel.tabBtn.style.opacity = '0.4';
         }
 
+        // Per-panel note detection (uses note_detect factory)
+        panel.detectChannel = prefs?.detectChannel || 'mono';
+        panel.detector = null;
+        panel.channelBtn.textContent = DETECT_CHANNEL_LABELS[panel.detectChannel];
+        const hasNoteDetect = typeof window.createNoteDetector === 'function';
+        if (hasNoteDetect) {
+            panel.detectBtn.onclick = () => toggleDetect(panel);
+            panel.channelBtn.onclick = () => cycleDetectChannel(panel);
+        } else {
+            panel.detectBtn.disabled = true;
+            panel.detectBtn.title = 'Note Detect plugin not loaded';
+            panel.detectBtn.style.opacity = '0.4';
+            panel.channelBtn.disabled = true;
+            panel.channelBtn.style.opacity = '0.4';
+        }
+
         if (isLyricsMode) {
             enterLyricsMode(panel);
         } else if (isJumpingTabMode) {
@@ -696,6 +726,35 @@
         }
     }
 
+    function toggleDetect(panel) {
+        if (panel.detector) {
+            panel.detector.destroy();
+            panel.detector = null;
+            panel.updateDetectStyle(false);
+            return;
+        }
+        if (typeof window.createNoteDetector !== 'function') return;
+        const channelMap = { mono: -1, left: 0, right: 1 };
+        panel.detector = window.createNoteDetector({
+            highway: panel.hw,
+            container: panel.panelDiv,
+            channel: channelMap[panel.detectChannel] ?? -1,
+        });
+        panel.detector.enable();
+        panel.updateDetectStyle(true);
+    }
+
+    function cycleDetectChannel(panel) {
+        const idx = DETECT_CHANNEL_CYCLE.indexOf(panel.detectChannel);
+        panel.detectChannel = DETECT_CHANNEL_CYCLE[(idx + 1) % DETECT_CHANNEL_CYCLE.length];
+        panel.channelBtn.textContent = DETECT_CHANNEL_LABELS[panel.detectChannel];
+        if (panel.detector) {
+            const channelMap = { mono: -1, left: 0, right: 1 };
+            panel.detector.setChannel(channelMap[panel.detectChannel]);
+        }
+        savePanelPrefs();
+    }
+
     function switchPanelArrangement(panel, arrIndex) {
         panel.arrIndex = arrIndex;
         panel.arrName.textContent = arrangements[arrIndex]?.name || '';
@@ -706,6 +765,10 @@
 
     function teardownPanels() {
         for (const p of panels) {
+            if (p.detector) {
+                p.detector.destroy();
+                p.detector = null;
+            }
             if (p.lyricsPane) {
                 p.lyricsPane.destroy();
                 p.lyricsPane = null;
@@ -742,6 +805,7 @@
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
             inverted: p.hw.getInverted(),
+            detectChannel: p.detectChannel || 'mono',
         }));
     }
 
