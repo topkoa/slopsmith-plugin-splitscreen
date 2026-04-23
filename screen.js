@@ -17,8 +17,9 @@
     const OFF_CLASS = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition';
     const ON_CLASS  = 'px-3 py-1.5 bg-blue-900/50 hover:bg-blue-900/60 rounded-lg text-xs text-blue-300 transition';
     const STORAGE_KEY = 'splitscreenPanelPrefs';
-    const LYRICS_VALUE = '__lyrics__';
-    const JUMPING_TAB_VALUE = '__jumping_tab__';
+    const LYRICS_VALUE       = '__lyrics__';
+    const JUMPING_TAB_VALUE  = '__jumping_tab__';
+    const HW3D_VALUE         = '__3d_highway__';
     const DETECT_CHANNEL_CYCLE  = ['mono', 'left', 'right'];
     const DETECT_CHANNEL_LABELS = { mono: 'M', left: 'L', right: 'R' };
 
@@ -65,9 +66,13 @@
         const prefs = panels.map(p => ({
             arrName: p.jumpingTabMode
                 ? JUMPING_TAB_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
+                : p.hw3dMode
+                ? HW3D_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
-            inverted: p.hw.getInverted(),
+            inverted: p.hw3dMode
+                ? (p.hw3dPane ? p.hw3dPane.getInverted() : p.hw3dInverted)
+                : p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
         }));
         localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
@@ -82,7 +87,7 @@
     }
 
     function resolveArrIndex(arrName) {
-        if (!arrName || arrName === LYRICS_VALUE || arrName.startsWith(JUMPING_TAB_VALUE)) return -1;
+        if (!arrName || arrName === LYRICS_VALUE || arrName.startsWith(JUMPING_TAB_VALUE) || arrName.startsWith(HW3D_VALUE)) return -1;
         const lower = arrName.toLowerCase();
         for (let i = 0; i < arrangements.length; i++) {
             if ((arrangements[i].name || '').toLowerCase() === lower) return i;
@@ -312,7 +317,7 @@
     function createPanel(index, container, layoutKey) {
         const panelDiv = document.createElement('div');
         panelDiv.className = 'splitscreen-panel';
-        panelDiv.style.cssText = 'position:relative;overflow:hidden;';
+        panelDiv.style.cssText = 'position:relative;overflow:hidden;box-sizing:border-box;border:1px solid #333;';
 
         if (layoutKey === 'quad') {
             panelDiv.style.width = '50%';
@@ -412,6 +417,8 @@
         for (const p of panels) {
             if (p.jumpingTabMode && p.jumpingTabPane) {
                 p.jumpingTabPane.resize();
+            } else if (p.hw3dMode && p.hw3dPane) {
+                p.hw3dPane.resize();
             } else if (!p.lyricsMode) {
                 p.hw.resize();
             }
@@ -441,6 +448,16 @@
                 jtOpt.textContent = (a.name || `Arr ${i}`) + ' (JT)';
                 if (panel.jumpingTabMode && panel.arrIndex === i) jtOpt.selected = true;
                 panel.select.appendChild(jtOpt);
+            });
+        }
+
+        if (typeof window.create3DHwPane === 'function') {
+            arrangements.forEach((a, i) => {
+                const opt = document.createElement('option');
+                opt.value = HW3D_VALUE + ':' + i;
+                opt.textContent = (a.name || `Arr ${i}`) + ' (3D)';
+                if (panel.hw3dMode && panel.arrIndex === i) opt.selected = true;
+                panel.select.appendChild(opt);
             });
         }
     }
@@ -545,13 +562,96 @@
         savePanelPrefs();
     }
 
+    function enter3DHwMode(panel) {
+        if (panel.hw3dMode) return;
+
+        if (panel.lyricsMode) exitLyricsMode(panel, panel.arrIndex);
+        if (panel.jumpingTabMode) exitJumpingTabMode(panel, panel.arrIndex);
+        if (panel.tabActive) togglePanelTab(panel);
+        panel.hw.stop();
+        panel.canvas.style.display = 'none';
+
+        // Keep invertBtn — wire it to pane invert rather than hiding it.
+        panel.lyricsBtn.style.display = 'none';
+        panel.tabBtn.style.display = 'none';
+
+        const paneContainer = document.createElement('div');
+        paneContainer.style.cssText =
+            'position:absolute;top:0;left:0;right:0;bottom:' +
+            ((panel.bar.offsetHeight || 28) + 'px') +
+            ';overflow:hidden;background:#08080e;z-index:2;';
+        panel.panelDiv.appendChild(paneContainer);
+
+        // hw3dInverted initialised in initPanel; preserve across arrangement switches.
+        const pane = window.create3DHwPane({ container: paneContainer, inverted: panel.hw3dInverted });
+        pane.connect(currentFilename, panel.arrIndex);
+        panel.hw3dMode = true;
+        panel.hw3dPane = pane;
+        panel.hw3dContainer = paneContainer;
+
+        panel.updateInvertStyle(panel.hw3dInverted);
+        panel.invertBtn.onclick = () => {
+            const newVal = !panel.hw3dPane.getInverted();
+            panel.hw3dPane.setInverted(newVal);
+            panel.hw3dInverted = newVal;
+            panel.updateInvertStyle(newVal);
+            savePanelPrefs();
+        };
+
+        panel.select.value = HW3D_VALUE + ':' + panel.arrIndex;
+        panel.arrName.textContent = (arrangements[panel.arrIndex]?.name || '') + ' (3D)';
+        savePanelPrefs();
+    }
+
+    function exit3DHwMode(panel, arrIndex) {
+        if (!panel.hw3dMode) return;
+
+        // Persist invert state so it survives the round-trip back to 3D mode.
+        if (panel.hw3dPane) {
+            panel.hw3dInverted = panel.hw3dPane.getInverted();
+            panel.hw3dPane.destroy();
+            panel.hw3dPane = null;
+        }
+        if (panel.hw3dContainer) {
+            panel.hw3dContainer.remove();
+            panel.hw3dContainer = null;
+        }
+
+        panel.canvas.style.display = '';
+        panel.lyricsBtn.style.display = '';
+        panel.tabBtn.style.display = '';
+        panel.hw3dMode = false;
+
+        panel.hw.init(panel.canvas);
+        panel.hw.resize();
+        panel.arrIndex = arrIndex;
+        panel.arrName.textContent = arrangements[arrIndex]?.name || '';
+        panel.hw.connect(getWsUrl(currentFilename, arrIndex), { onSongInfo: () => {} });
+
+        // Restore normal invertBtn behaviour (highway instance).
+        panel.updateInvertStyle(panel.hw.getInverted());
+        panel.invertBtn.onclick = () => {
+            const on = !panel.hw.getInverted();
+            panel.hw.setInverted(on);
+            panel.updateInvertStyle(on);
+            savePanelPrefs();
+        };
+
+        savePanelPrefs();
+    }
+
     function initPanel(panel, arrIndex, prefs) {
         const isLyricsMode = prefs?.arrName === LYRICS_VALUE;
         const isJumpingTabMode = prefs?.arrName?.startsWith(JUMPING_TAB_VALUE) || false;
+        const is3DMode = prefs?.arrName?.startsWith(HW3D_VALUE) || false;
         if (isJumpingTabMode) {
             const jtArrName = prefs.arrName.slice(JUMPING_TAB_VALUE.length + 1);
             const jtIdx = resolveArrIndex(jtArrName);
             panel.arrIndex = jtIdx >= 0 ? jtIdx : arrIndex;
+        } else if (is3DMode) {
+            const d3ArrName = prefs.arrName.slice(HW3D_VALUE.length + 1);
+            const d3Idx = resolveArrIndex(d3ArrName);
+            panel.arrIndex = d3Idx >= 0 ? d3Idx : arrIndex;
         } else {
             panel.arrIndex = isLyricsMode ? 0 : arrIndex;
         }
@@ -560,21 +660,29 @@
         panel.jumpingTabMode = false;
         panel.jumpingTabPane = null;
         panel.jumpingTabContainer = null;
+        panel.hw3dMode = false;
+        panel.hw3dPane = null;
+        panel.hw3dContainer = null;
+        // Persist invert across arrangement switches within 3D pane mode.
+        panel.hw3dInverted = is3DMode ? (prefs?.inverted ?? false) : false;
 
         panel.hw.init(panel.canvas);
 
         // Apply saved preferences
-        if (prefs && !isLyricsMode && !isJumpingTabMode) {
+        if (prefs && !isLyricsMode && !isJumpingTabMode && !is3DMode) {
             if (prefs.inverted !== undefined) panel.hw.setInverted(prefs.inverted);
             if (prefs.lyrics !== undefined && typeof panel.hw.setLyricsVisible === 'function') {
                 panel.hw.setLyricsVisible(prefs.lyrics);
             }
         }
 
-        // Populate arrangement dropdown (includes Lyrics option)
+        // Populate arrangement dropdown (includes Lyrics, JT, and 3D options)
         populateSelect(panel, arrIndex);
 
-        panel.arrName.textContent = isLyricsMode ? 'Lyrics' : isJumpingTabMode ? 'Jumping Tab' : (arrangements[arrIndex]?.name || '');
+        panel.arrName.textContent = isLyricsMode ? 'Lyrics'
+            : isJumpingTabMode ? 'Jumping Tab'
+            : is3DMode ? (arrangements[panel.arrIndex]?.name || '') + ' (3D)'
+            : (arrangements[arrIndex]?.name || '');
 
         panel.select.onchange = () => {
             const val = panel.select.value;
@@ -589,12 +697,25 @@
                     panel.jumpingTabMode = false;
                 }
                 enterJumpingTabMode(panel);
+            } else if (val.startsWith(HW3D_VALUE + ':')) {
+                const d3Idx = parseInt(val.split(':')[1]);
+                panel.arrIndex = d3Idx;
+                if (panel.hw3dMode) {
+                    panel.hw3dPane.destroy();
+                    panel.hw3dPane = null;
+                    panel.hw3dContainer.remove();
+                    panel.hw3dContainer = null;
+                    panel.hw3dMode = false;
+                }
+                enter3DHwMode(panel);
             } else if (val === LYRICS_VALUE) {
                 enterLyricsMode(panel);
             } else {
                 const newIdx = parseInt(val);
                 if (panel.jumpingTabMode) {
                     exitJumpingTabMode(panel, newIdx);
+                } else if (panel.hw3dMode) {
+                    exit3DHwMode(panel, newIdx);
                 } else if (panel.lyricsMode) {
                     exitLyricsMode(panel, newIdx);
                 } else {
@@ -659,6 +780,8 @@
             enterLyricsMode(panel);
         } else if (isJumpingTabMode) {
             enterJumpingTabMode(panel);
+        } else if (is3DMode) {
+            enter3DHwMode(panel);
         } else {
             // Connect WebSocket. Pass an empty onSongInfo so core skips its
             // default writes to shared HUD / audio / arrangement dropdown
@@ -777,6 +900,10 @@
                 p.jumpingTabPane.destroy();
                 p.jumpingTabPane = null;
             }
+            if (p.hw3dPane) {
+                p.hw3dPane.destroy();
+                p.hw3dPane = null;
+            }
             if (p.tabInstance) {
                 try { p.tabInstance.destroy(); } catch (_) {}
                 p.tabInstance = null;
@@ -802,9 +929,13 @@
         return panels.map(p => ({
             arrName: p.jumpingTabMode
                 ? JUMPING_TAB_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
+                : p.hw3dMode
+                ? HW3D_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
-            inverted: p.hw.getInverted(),
+            inverted: p.hw3dMode
+                ? (p.hw3dPane ? p.hw3dPane.getInverted() : p.hw3dInverted)
+                : p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
         }));
     }
@@ -839,6 +970,10 @@
                     const jtArrName = pref.arrName.slice(JUMPING_TAB_VALUE.length + 1);
                     const jtIdx = resolveArrIndex(jtArrName);
                     arrDefaults.push(jtIdx >= 0 ? jtIdx : 0);
+                } else if (pref && pref.arrName?.startsWith(HW3D_VALUE)) {
+                    const d3ArrName = pref.arrName.slice(HW3D_VALUE.length + 1);
+                    const d3Idx = resolveArrIndex(d3ArrName);
+                    arrDefaults.push(d3Idx >= 0 ? d3Idx : 0);
                 } else {
                     const idx = pref ? resolveArrIndex(pref.arrName) : -1;
                     arrDefaults.push(idx >= 0 ? idx : getDefaultArrangements(1)[0]);
@@ -929,7 +1064,7 @@
             if (!audio || !active) return;
             const t = audio.currentTime;
             for (const p of panels) {
-                if (!p.lyricsMode && !p.jumpingTabMode) p.hw.setTime(t);
+                if (!p.lyricsMode && !p.jumpingTabMode && !p.hw3dMode) p.hw.setTime(t);
             }
         }, 1000 / 60);
     }
