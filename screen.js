@@ -24,6 +24,75 @@
     let currentFilename = null;
     let arrangements = []; // arrangement list from song_info
 
+    // Focus-driven inter-plugin coordination. Wave C adds per-panel
+    // setRenderer picker support; plugins like piano/drums that use
+    // a MIDI / audio-input singleton across the page need to know
+    // WHICH panel currently owns that singleton. The focused panel
+    // is the one the user most recently clicked. When splitscreen
+    // is inactive, focus is null and plugins fall back to their
+    // single-instance fast path.
+    let _focusedPanelIndex = null;
+    const _focusBus = new EventTarget();
+
+    // Cached /api/plugins response for the per-panel viz picker.
+    // Lazily populated on first splitscreen start. Intersected with
+    // `window.slopsmithViz_<id>` presence so the picker only lists
+    // plugins whose factory actually loaded.
+    let _vizPlugins = null;
+    let _vizPluginsPromise = null;
+
+    function _fetchVizPlugins() {
+        if (_vizPlugins) return Promise.resolve(_vizPlugins);
+        if (_vizPluginsPromise) return _vizPluginsPromise;
+        _vizPluginsPromise = fetch('/api/plugins')
+            .then(r => {
+                if (!r.ok) throw new Error('[splitscreen] /api/plugins HTTP ' + r.status);
+                return r.json();
+            })
+            .then(list => {
+                _vizPlugins = (Array.isArray(list) ? list : [])
+                    .filter(p => p && p.type === 'visualization')
+                    .filter(p => typeof window['slopsmithViz_' + p.id] === 'function');
+                return _vizPlugins;
+            })
+            .catch(e => {
+                // Do NOT cache an empty result on failure — a 500
+                // during app startup or a transient network blip
+                // would otherwise wedge every subsequent panel-open
+                // at "Highway only" until a full page reload.
+                // Returning [] for the in-flight request is the
+                // right graceful degradation; nulling
+                // _vizPluginsPromise lets the NEXT call retry.
+                console.warn('[splitscreen] /api/plugins fetch failed:', e);
+                _vizPluginsPromise = null;
+                return [];
+            });
+        return _vizPluginsPromise;
+    }
+
+    function setFocusedPanel(index) {
+        if (!active) return;
+        if (_focusedPanelIndex === index) return;
+        const previous = _focusedPanelIndex;
+        _focusedPanelIndex = index;
+        // Visual indicator — accent the focused panel with a subtle
+        // inner border. Cheap inline style update; no class / CSS
+        // dependency.
+        for (let i = 0; i < panels.length; i++) {
+            const p = panels[i];
+            if (!p || !p.panelDiv) continue;
+            p.panelDiv.style.boxShadow = (i === index)
+                ? 'inset 0 0 0 2px rgba(64,128,224,0.9)'
+                : 'none';
+            if (p.focusPill) {
+                p.focusPill.style.display = (i === index) ? '' : 'none';
+            }
+        }
+        _focusBus.dispatchEvent(new CustomEvent('focus-change', {
+            detail: { newPanelId: index, previousPanelId: previous },
+        }));
+    }
+
     // ── Settings sync ──
     const layoutSelect = document.getElementById('splitscreen-default-layout');
     if (layoutSelect) {
@@ -132,6 +201,37 @@
         arrName.style.cssText = 'font-size:11px;color:#6b7280;';
         bar.appendChild(arrName);
 
+        // Per-panel viz picker (slopsmith#36 Wave C). Populated from
+        // /api/plugins intersected with `window.slopsmithViz_<id>`
+        // presence, plus a static "Highway" entry for the built-in
+        // 2D renderer. Selection calls panel.hw.setRenderer(factory())
+        // — or setRenderer(null) for "Highway". Populated in initPanel
+        // once the cached plugin list resolves; the <select> is
+        // inserted empty here so its DOM position is reserved.
+        const vizSelect = document.createElement('select');
+        vizSelect.style.cssText =
+            'background:#1a1a2e;border:1px solid #333;border-radius:4px;' +
+            'padding:2px 4px;font-size:11px;color:#ccc;outline:none;max-width:110px;';
+        vizSelect.title = 'Visualization';
+        const vizDefault = document.createElement('option');
+        vizDefault.value = 'default';
+        vizDefault.textContent = 'Highway';
+        vizSelect.appendChild(vizDefault);
+        bar.appendChild(vizSelect);
+
+        // Focus pill — visible only on the currently-focused panel so
+        // plugins that route MIDI / audio to the focused panel (piano,
+        // drums under Wave C) have a clear user-facing signal about
+        // which one owns the input. Hidden by default; setFocusedPanel
+        // toggles display.
+        const focusPill = document.createElement('span');
+        focusPill.textContent = 'FOCUS';
+        focusPill.style.cssText =
+            'margin-left:4px;padding:1px 6px;border-radius:4px;' +
+            'background:rgba(64,128,224,0.25);color:#8ab4ff;' +
+            'font-size:9px;font-weight:bold;letter-spacing:0.5px;display:none;';
+        bar.appendChild(focusPill);
+
         const makeToggleBtn = (label, marginLeft) => {
             const b = document.createElement('button');
             b.style.cssText =
@@ -179,8 +279,19 @@
         panelDiv.appendChild(bar);
         container.appendChild(panelDiv);
 
+        // Click-to-focus. Listen on the panel root so anywhere inside
+        // (canvas, control bar, etc.) counts as "user is interacting
+        // with this panel." setFocusedPanel below short-circuits when
+        // the index is already focused, so clicks inside controls
+        // (including their own onclick handlers) don't thrash the
+        // focus bus. Capture phase so the focus update lands before
+        // the clicked element's own handler runs — matters for
+        // plugins that read focus state during their click handler.
+        panelDiv.addEventListener('click', () => setFocusedPanel(index), true);
+
         return {
             panelDiv, canvas, bar, select, arrName,
+            vizSelect, focusPill,
             invertBtn, updateInvertStyle,
             lyricsBtn, updateLyricsStyle,
             tabBtn, updateTabStyle,
@@ -216,6 +327,79 @@
         panel.select.onchange = () => {
             const newIdx = parseInt(panel.select.value);
             switchPanelArrangement(panel, newIdx);
+        };
+
+        // Per-panel viz picker — requires slopsmith core with
+        // setRenderer support (Wave A, slopsmith#84 onwards). Older
+        // cores expose createHighway() without setRenderer; calling
+        // it would throw and leave the panel's controls in a broken
+        // state. Mirror the capability-check pattern used for the
+        // lyrics and mastery controls: disable the <select> and
+        // explain via tooltip.
+        const hasSetRenderer = typeof panel.hw.setRenderer === 'function';
+        if (!hasSetRenderer) {
+            panel.vizSelect.disabled = true;
+            panel.vizSelect.title =
+                'Per-panel visualization requires a slopsmith core with setRenderer support';
+            panel.vizSelect.style.opacity = '0.4';
+        } else {
+            // Populate asynchronously once /api/plugins has been
+            // fetched (cached across panels). The "Highway" option
+            // is already inserted statically so the picker has
+            // something usable before the fetch resolves.
+            _fetchVizPlugins().then(vizList => {
+                if (!panels.includes(panel)) return;  // panel torn down
+                // Clear any prior plugin entries (defensive; only the
+                // static "default" option exists today, but a layout
+                // rebuild could call initPanel on the same element).
+                for (let i = panel.vizSelect.options.length - 1; i >= 0; i--) {
+                    if (panel.vizSelect.options[i].value !== 'default') {
+                        panel.vizSelect.remove(i);
+                    }
+                }
+                for (const p of vizList) {
+                    const opt = document.createElement('option');
+                    opt.value = p.id;
+                    opt.textContent = p.name || p.id;
+                    panel.vizSelect.appendChild(opt);
+                }
+            });
+        }
+
+        panel.vizSelect.onchange = () => {
+            if (!hasSetRenderer) return;
+            const id = panel.vizSelect.value;
+            if (id === 'default' || !id) {
+                panel.hw.setRenderer(null);
+                return;
+            }
+            const factory = window['slopsmithViz_' + id];
+            if (typeof factory !== 'function') {
+                console.error(
+                    `[splitscreen] viz picker: factory slopsmithViz_${id} unavailable; ` +
+                    `resetting panel ${panel._index + 1} to Highway`
+                );
+                panel.vizSelect.value = 'default';
+                panel.hw.setRenderer(null);
+                return;
+            }
+            let renderer;
+            try { renderer = factory(); }
+            catch (e) {
+                console.error(`[splitscreen] viz picker: factory slopsmithViz_${id} threw:`, e);
+                panel.vizSelect.value = 'default';
+                panel.hw.setRenderer(null);
+                return;
+            }
+            if (!renderer || typeof renderer.draw !== 'function') {
+                console.error(
+                    `[splitscreen] viz picker: factory slopsmithViz_${id} returned an invalid renderer`
+                );
+                panel.vizSelect.value = 'default';
+                panel.hw.setRenderer(null);
+                return;
+            }
+            panel.hw.setRenderer(renderer);
         };
 
         // Per-panel invert toggle
@@ -386,6 +570,26 @@
     }
 
     function teardownPanels() {
+        // Emit a final focus-change BEFORE destroying the panels so
+        // Wave C consumers (piano / drums MIDI routing etc.) have a
+        // chance to detach from the panel they were routing to
+        // while its DOM still exists. newPanelId: null signals "no
+        // panel is focused anymore — unhook your singleton inputs".
+        //
+        // Clear _focusedPanelIndex BEFORE dispatching so the public
+        // focusedPanelId() getter returns null during the handler
+        // call, matching detail.newPanelId. Otherwise a consumer
+        // that reads focusedPanelId() inside its focus-change
+        // handler would see the OLD focused index while the event
+        // payload claims the focus moved to null — an observable
+        // inconsistency.
+        const previous = _focusedPanelIndex;
+        _focusedPanelIndex = null;
+        if (previous !== null) {
+            _focusBus.dispatchEvent(new CustomEvent('focus-change', {
+                detail: { newPanelId: null, previousPanelId: previous },
+            }));
+        }
         for (const p of panels) {
             if (p.tabInstance) {
                 try { p.tabInstance.destroy(); } catch (_) {}
@@ -423,7 +627,7 @@
         for (let i = 0; i < cfg.panels; i++) {
             const parts = createPanel(i, container, layout);
             const hw = createHighway();
-            const panel = Object.assign({ hw, arrIndex: 0 }, parts);
+            const panel = Object.assign({ hw, arrIndex: 0, _index: i }, parts);
 
             // Override resize BEFORE init — highway's default sizes to full window,
             // which clobbers all panels to overlap. Size to parent panel instead.
@@ -454,6 +658,12 @@
         sizeCanvases();
         active = true;
         updateBtn();
+
+        // Default focus to panel 0 so plugins that route MIDI / audio
+        // to the focused panel have a sensible initial target. User
+        // can click another panel to re-route at any time.
+        _focusedPanelIndex = null;  // force setFocusedPanel to emit
+        setFocusedPanel(0);
 
         // Hook into the time sync loop
         startTimeSync();
@@ -590,5 +800,84 @@
     window.showScreen = function (id) {
         if (id !== 'player' && active) stopSplitScreen();
         _show(id);
+    };
+
+    // ── Public surface for per-instance-aware viz plugins ──────────
+    //
+    // slopsmith#36 Wave C contract: when splitscreen is active, a
+    // plugin can consult this surface to discover (a) that it's
+    // running inside a panel rather than the main player, (b) which
+    // panel currently has user focus, and (c) DOM anchors inside its
+    // own panel's chrome for injecting per-instance UI (gear buttons,
+    // settings strips, etc.).
+    //
+    // Gate on `isActive()` rather than presence — this object is
+    // registered unconditionally once the plugin script loads, even
+    // while splitscreen is toggled off. Plugins that subscribe to
+    // onFocusChange and check isActive() at handler time get the
+    // right behaviour; plugins that only existence-check would
+    // unnecessarily disable their single-instance main-player
+    // fast path just because the splitscreen plugin is installed.
+    // Wave B plugins today don't consult this surface at all;
+    // Wave C plugin PRs opt in.
+    window.slopsmithSplitscreen = {
+        // True while the splitscreen overlay is visible.
+        isActive: () => active,
+
+        // Numeric panel index (0-based) of the currently-focused
+        // panel, or null when splitscreen is inactive. "Focus" here
+        // is a splitscreen-local concept — the panel the user last
+        // clicked, used to route MIDI / audio / other singletons to
+        // a single panel when N panels all host the same plugin.
+        focusedPanelId: () => active ? _focusedPanelIndex : null,
+
+        // Subscribe / unsubscribe to focus-change events. Handler
+        // receives a CustomEvent with
+        // `detail = { newPanelId, previousPanelId }`. Plugins that
+        // bind to a focused panel should re-attach on newPanelId
+        // matches and detach on previousPanelId matches.
+        onFocusChange: (fn) => _focusBus.addEventListener('focus-change', fn),
+        offFocusChange: (fn) => _focusBus.removeEventListener('focus-change', fn),
+
+        // Map a canvas element back to its panel's root DOM node.
+        // Plugins that want to inject a per-instance UI affordance
+        // (gear button, toggle, badge) use this to find the right
+        // container — `#player-controls` is the main-player anchor
+        // and doesn't exist per-panel.
+        panelChromeFor: (canvasEl) => {
+            if (!active || !canvasEl) return null;
+            for (const p of panels) {
+                if (p.canvas === canvasEl) return p.panelDiv;
+            }
+            return null;
+        },
+
+        // A specific element inside the panel's chrome that plugins
+        // can append their gear / settings affordances to. Today
+        // this is the panel's bottom control bar; callers should
+        // insertBefore / appendChild as appropriate.
+        settingsAnchorFor: (canvasEl) => {
+            if (!active || !canvasEl) return null;
+            for (const p of panels) {
+                if (p.canvas === canvasEl) return p.bar;
+            }
+            return null;
+        },
+
+        // Imperative focus control — useful from a plugin's settings
+        // UI where the user chose to route MIDI to a specific panel
+        // via a dropdown rather than a click. Idempotent.
+        // Range comparisons fall through silently for non-numerics
+        // (NaN comparisons always yield false), so coerce to a
+        // Number and require an integer before the range check to
+        // reject `<select>` string values that failed to parse,
+        // floating-point inputs, and arbitrary plugin-provided junk.
+        setFocusedPanelId: (index) => {
+            if (!active) return;
+            const panelIndex = Number(index);
+            if (!Number.isInteger(panelIndex)) return;
+            if (panelIndex < 0 || panelIndex >= panels.length) return;
+            setFocusedPanel(panelIndex);
+        },
     };
 })();
