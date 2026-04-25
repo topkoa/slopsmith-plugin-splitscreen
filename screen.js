@@ -70,13 +70,8 @@
                 ? HW3D_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
-            inverted: p.hw3dMode
-                ? (p.hw3dPane ? p.hw3dPane.getInverted() : p.hw3dInverted)
-                : p.hw.getInverted(),
+            inverted: p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
-            hw3dViewMode: p.hw3dMode
-                ? (p.hw3dPane && typeof p.hw3dPane.getViewMode === 'function' ? p.hw3dPane.getViewMode() : p.hw3dViewMode)
-                : p.hw3dViewMode,
         }));
         localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
     }
@@ -425,8 +420,6 @@
         for (const p of panels) {
             if (p.jumpingTabMode && p.jumpingTabPane) {
                 p.jumpingTabPane.resize();
-            } else if (p.hw3dMode && p.hw3dPane) {
-                p.hw3dPane.resize();
             } else if (!p.lyricsMode) {
                 p.hw.resize();
             }
@@ -459,7 +452,7 @@
             });
         }
 
-        if (typeof window.create3DHwPane === 'function') {
+        if (typeof window.slopsmithViz_highway_3d === 'function') {
             arrangements.forEach((a, i) => {
                 const opt = document.createElement('option');
                 opt.value = HW3D_VALUE + ':' + i;
@@ -535,7 +528,11 @@
         panel.panelDiv.appendChild(jtContainer);
 
         const pane = window.createJumpingTabPane({ container: jtContainer });
-        pane.connect(currentFilename, panel.arrIndex);
+        if (currentFilename) {
+            pane.connect(currentFilename, panel.arrIndex).catch(e => {
+                console.warn('[splitscreen] jumping tab connect failed:', e.message);
+            });
+        }
         panel.jumpingTabMode = true;
         panel.jumpingTabPane = pane;
         panel.jumpingTabContainer = jtContainer;
@@ -576,54 +573,22 @@
         if (panel.lyricsMode) exitLyricsMode(panel, panel.arrIndex);
         if (panel.jumpingTabMode) exitJumpingTabMode(panel, panel.arrIndex);
         if (panel.tabActive) togglePanelTab(panel);
-        panel.hw.stop();
-        panel.canvas.style.display = 'none';
 
-        // Keep invertBtn — wire it to pane invert rather than hiding it.
         panel.lyricsBtn.style.display = 'none';
         panel.tabBtn.style.display = 'none';
+        panel.viewBtn.style.display = 'none';
 
-        const paneContainer = document.createElement('div');
-        paneContainer.style.cssText =
-            'position:absolute;top:0;left:0;right:0;bottom:' +
-            ((panel.bar.offsetHeight || 28) + 'px') +
-            ';overflow:hidden;background:#08080e;z-index:2;';
-        panel.panelDiv.appendChild(paneContainer);
-
-        // hw3dInverted and hw3dViewMode initialised in initPanel; preserve across arrangement switches.
-        const pane = window.create3DHwPane({ container: paneContainer, inverted: panel.hw3dInverted });
-        if (typeof pane.setViewMode === 'function' && panel.hw3dViewMode) {
-            pane.setViewMode(panel.hw3dViewMode);
-        }
-        pane.connect(currentFilename, panel.arrIndex);
+        // Hand the panel's existing highway a 3D renderer, then connect so
+        // the highway's WebSocket and RAF loop start feeding draw(bundle) calls.
+        panel.hw.setRenderer(window.slopsmithViz_highway_3d());
+        panel.hw.connect(getWsUrl(currentFilename, panel.arrIndex), { onSongInfo: () => {} });
         panel.hw3dMode = true;
-        panel.hw3dPane = pane;
-        panel.hw3dContainer = paneContainer;
 
-        panel.updateInvertStyle(panel.hw3dInverted);
+        panel.updateInvertStyle(panel.hw.getInverted());
         panel.invertBtn.onclick = () => {
-            const newVal = !panel.hw3dPane.getInverted();
-            panel.hw3dPane.setInverted(newVal);
-            panel.hw3dInverted = newVal;
-            panel.updateInvertStyle(newVal);
-            savePanelPrefs();
-        };
-
-        // View cycle button
-        const _updateViewBtn = () => {
-            const vid = panel.hw3dPane.getViewMode?.();
-            panel.viewBtn.textContent = vid === 'perspective' ? 'Persp' : 'CLS';
-            panel.viewBtn.style.background = vid === 'perspective' ? '#1e3a5f' : '#1a1a2e';
-            panel.viewBtn.style.color      = vid === 'perspective' ? '#fff'    : '#9ca3af';
-        };
-        _updateViewBtn();
-        panel.viewBtn.style.display = '';
-        panel.viewBtn.onclick = () => {
-            if (!panel.hw3dPane) return;
-            const current = panel.hw3dPane.getViewMode();
-            pane.setViewMode(current === 'classic' ? 'perspective' : 'classic');
-            panel.hw3dViewMode = panel.hw3dPane.getViewMode();
-            _updateViewBtn();
+            const on = !panel.hw.getInverted();
+            panel.hw.setInverted(on);
+            panel.updateInvertStyle(on);
             savePanelPrefs();
         };
 
@@ -635,30 +600,18 @@
     function exit3DHwMode(panel, arrIndex) {
         if (!panel.hw3dMode) return;
 
-        // Persist invert state so it survives the round-trip back to 3D mode.
-        if (panel.hw3dPane) {
-            panel.hw3dInverted = panel.hw3dPane.getInverted();
-            panel.hw3dPane.destroy();
-            panel.hw3dPane = null;
-        }
-        if (panel.hw3dContainer) {
-            panel.hw3dContainer.remove();
-            panel.hw3dContainer = null;
-        }
-
-        panel.canvas.style.display = '';
-        panel.lyricsBtn.style.display = '';
-        panel.tabBtn.style.display = '';
-        panel.viewBtn.style.display = 'none';
+        // Revert to the default highway renderer — calls destroy() on the 3D
+        // renderer which restores the 2D canvas display automatically.
+        panel.hw.setRenderer(null);
         panel.hw3dMode = false;
 
-        panel.hw.init(panel.canvas);
-        panel.hw.resize();
+        panel.lyricsBtn.style.display = '';
+        panel.tabBtn.style.display = '';
+
         panel.arrIndex = arrIndex;
         panel.arrName.textContent = arrangements[arrIndex]?.name || '';
         panel.hw.connect(getWsUrl(currentFilename, arrIndex), { onSongInfo: () => {} });
 
-        // Restore normal invertBtn behaviour (highway instance).
         panel.updateInvertStyle(panel.hw.getInverted());
         panel.invertBtn.onclick = () => {
             const on = !panel.hw.getInverted();
@@ -691,11 +644,6 @@
         panel.jumpingTabPane = null;
         panel.jumpingTabContainer = null;
         panel.hw3dMode = false;
-        panel.hw3dPane = null;
-        panel.hw3dContainer = null;
-        // Persist invert and view mode across arrangement switches within 3D pane mode.
-        panel.hw3dInverted  = is3DMode ? (prefs?.inverted     ?? false)     : false;
-        panel.hw3dViewMode  = is3DMode ? (prefs?.hw3dViewMode || 'classic') : 'classic';
 
         panel.hw.init(panel.canvas);
 
@@ -732,13 +680,13 @@
                 const d3Idx = parseInt(val.split(':')[1]);
                 panel.arrIndex = d3Idx;
                 if (panel.hw3dMode) {
-                    panel.hw3dPane.destroy();
-                    panel.hw3dPane = null;
-                    panel.hw3dContainer.remove();
-                    panel.hw3dContainer = null;
-                    panel.hw3dMode = false;
+                    // Already in 3D — reconnect the highway to the new arrangement.
+                    panel.hw.connect(getWsUrl(currentFilename, d3Idx), { onSongInfo: () => {} });
+                    panel.arrName.textContent = (arrangements[d3Idx]?.name || '') + ' (3D)';
+                    savePanelPrefs();
+                } else {
+                    enter3DHwMode(panel);
                 }
-                enter3DHwMode(panel);
             } else if (val === LYRICS_VALUE) {
                 enterLyricsMode(panel);
             } else {
@@ -931,9 +879,9 @@
                 p.jumpingTabPane.destroy();
                 p.jumpingTabPane = null;
             }
-            if (p.hw3dPane) {
-                p.hw3dPane.destroy();
-                p.hw3dPane = null;
+            if (p.hw3dMode) {
+                p.hw.setRenderer(null);
+                p.hw3dMode = false;
             }
             if (p.tabInstance) {
                 try { p.tabInstance.destroy(); } catch (_) {}
@@ -964,13 +912,8 @@
                 ? HW3D_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
-            inverted: p.hw3dMode
-                ? (p.hw3dPane ? p.hw3dPane.getInverted() : p.hw3dInverted)
-                : p.hw.getInverted(),
+            inverted: p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
-            hw3dViewMode: p.hw3dMode
-                ? (p.hw3dPane && typeof p.hw3dPane.getViewMode === 'function' ? p.hw3dPane.getViewMode() : p.hw3dViewMode)
-                : p.hw3dViewMode,
         }));
     }
 
@@ -1098,7 +1041,7 @@
             if (!audio || !active) return;
             const t = audio.currentTime;
             for (const p of panels) {
-                if (!p.lyricsMode && !p.jumpingTabMode && !p.hw3dMode) p.hw.setTime(t);
+                if (!p.lyricsMode && !p.jumpingTabMode) p.hw.setTime(t);
             }
         }, 1000 / 60);
     }
