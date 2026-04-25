@@ -574,10 +574,10 @@
         panel.tabBtn.style.display = 'none';
         panel.viewBtn.style.display = 'none';
 
-        // Hand the panel's existing highway a 3D renderer. The highway keeps
-        // its WebSocket/data running and calls draw(bundle) each frame; the
-        // renderer hides the 2D canvas itself once Three.js is ready.
+        // Hand the panel's existing highway a 3D renderer, then connect so
+        // the highway's WebSocket and RAF loop start feeding draw(bundle) calls.
         panel.hw.setRenderer(window.slopsmithViz_highway_3d());
+        panel.hw.connect(getWsUrl(currentFilename, panel.arrIndex), { onSongInfo: () => {} });
         panel.hw3dMode = true;
 
         panel.updateInvertStyle(panel.hw.getInverted());
