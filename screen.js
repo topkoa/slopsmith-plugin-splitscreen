@@ -464,6 +464,42 @@
         }
     }
 
+    // ── Highway re-creation (fixes issue #22: charts mix on mid-song arrangement switch) ──
+    // hw.reconnect() / hw.connect() in core close+reopen the WS, but the OLD WS's
+    // onmessage handler is bound with a closure that still references the same
+    // outer-scope `notes`/`chords` arrays. Pending messages from the old socket
+    // can fire after the arrays are cleared, leaking the previous chart's data
+    // into the new arrangement. Replacing the highway instance entirely orphans
+    // the old closure so late messages can't pollute the new chart.
+    function recreatePanelHighway(panel) {
+        const old = panel.hw;
+        const inverted = old.getInverted();
+        const lyricsVisible = typeof old.getLyricsVisible === 'function' ? old.getLyricsVisible() : true;
+        const mastery = old.getMastery();
+        old.stop();
+
+        const hw = createHighway();
+        hw.resize = function () {
+            const c = panel.canvas;
+            if (!c) return;
+            const rect = panel.panelDiv.getBoundingClientRect();
+            const barH = panel.bar.style.display === 'none' ? 0 : (panel.bar.offsetHeight || 28);
+            const w = rect.width;
+            const h = Math.max(0, rect.height - barH);
+            c.style.width = w + 'px';
+            c.style.height = h + 'px';
+            const scale = hw.getRenderScale();
+            c.width = Math.round(w * scale);
+            c.height = Math.round(h * scale);
+        };
+        hw.init(panel.canvas);
+        hw.setInverted(inverted);
+        if (typeof hw.setLyricsVisible === 'function') hw.setLyricsVisible(lyricsVisible);
+        hw.setMastery(mastery);
+        hw.resize();
+        panel.hw = hw;
+    }
+
     // ── Mastery slider helpers ──
     function hookPanelReady(panel) {
         panel.masterySlider.disabled = true;
@@ -755,10 +791,21 @@
                 const d3Idx = parseInt(val.split(':')[1]);
                 panel.arrIndex = d3Idx;
                 if (panel.hw3dMode) {
-                    // Already in 3D — reconnect the highway to the new arrangement.
+                    // Already in 3D — recreate hw to avoid the old WS leaking
+                    // notes from the previous arrangement into the new one.
+                    recreatePanelHighway(panel);
+                    panel.hw.setRenderer(window.slopsmithViz_highway_3d());
                     hookPanelReady(panel);
                     panel.hw.connect(getWsUrl(currentFilename, d3Idx), { onSongInfo: () => {} });
                     panel.arrName.textContent = (arrangements[d3Idx]?.name || '') + ' (3D)';
+                    // Re-bind invert handler on the fresh hw
+                    panel.updateInvertStyle(panel.hw.getInverted());
+                    panel.invertBtn.onclick = () => {
+                        const on = !panel.hw.getInverted();
+                        panel.hw.setInverted(on);
+                        panel.updateInvertStyle(on);
+                        savePanelPrefs();
+                    };
                     savePanelPrefs();
                 } else {
                     enter3DHwMode(panel);
@@ -938,8 +985,9 @@
         panel.arrIndex = arrIndex;
         panel.arrName.textContent = arrangements[arrIndex]?.name || '';
         if (panel.tabActive) togglePanelTab(panel);
+        recreatePanelHighway(panel);
         hookPanelReady(panel);
-        panel.hw.reconnect(currentFilename, arrIndex);
+        panel.hw.connect(getWsUrl(currentFilename, arrIndex), { onSongInfo: () => {} });
     }
 
     function teardownPanels() {
