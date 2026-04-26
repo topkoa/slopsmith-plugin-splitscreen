@@ -74,6 +74,7 @@
             inverted: p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
             barHidden: p.bar.style.display === 'none',
+            mastery: p.hw.getMastery(),
         }));
         localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
     }
@@ -338,7 +339,7 @@
         const bar = document.createElement('div');
         bar.style.cssText =
             'position:absolute;bottom:0;left:0;right:0;' +
-            'display:flex;align-items:center;gap:6px;padding:4px 8px;' +
+            'display:flex;align-items:center;gap:10px;padding:4px 8px;' +
             'flex-wrap:nowrap;overflow:hidden;' +
             'background:rgba(8,8,16,0.85);z-index:5;';
 
@@ -402,6 +403,27 @@
         viewBtn.style.display = 'none';
         bar.appendChild(viewBtn);
 
+        const masteryHeading = document.createElement('span');
+        masteryHeading.style.cssText = 'font-size:10px;color:#6b7280;white-space:nowrap;';
+        masteryHeading.textContent = 'Mastery';
+        bar.appendChild(masteryHeading);
+
+        const masterySlider = document.createElement('input');
+        masterySlider.type = 'range';
+        masterySlider.min = '0';
+        masterySlider.max = '100';
+        masterySlider.step = '5';
+        masterySlider.value = '100';
+        masterySlider.disabled = true;
+        masterySlider.style.cssText = 'width:52px;accent-color:#4080e0;cursor:not-allowed;opacity:0.4;';
+        masterySlider.title = 'Master difficulty (requires multi-level chart)';
+        bar.appendChild(masterySlider);
+
+        const masteryLabel = document.createElement('span');
+        masteryLabel.style.cssText = 'font-size:10px;color:#6b7280;min-width:26px;';
+        masteryLabel.textContent = '—';
+        bar.appendChild(masteryLabel);
+
         panelDiv.appendChild(bar);
 
         const barToggleBtn = document.createElement('button');
@@ -424,6 +446,7 @@
             tabBtn, updateTabStyle,
             detectBtn, updateDetectStyle,
             channelBtn, viewBtn,
+            masteryHeading, masterySlider, masteryLabel,
         };
     }
 
@@ -439,6 +462,23 @@
                 p.hw.resize();
             }
         }
+    }
+
+    // ── Mastery slider helpers ──
+    function hookPanelReady(panel) {
+        panel.masterySlider.disabled = true;
+        panel.masterySlider.style.opacity = '0.4';
+        panel.masterySlider.style.cursor = 'not-allowed';
+        panel.masteryLabel.textContent = '—';
+        const prev = panel.hw._onReady;
+        panel.hw._onReady = () => {
+            if (prev) prev();
+            const has = panel.hw.hasPhraseData();
+            panel.masterySlider.disabled = !has;
+            panel.masterySlider.style.opacity = has ? '1' : '0.4';
+            panel.masterySlider.style.cursor = has ? 'pointer' : 'not-allowed';
+            panel.masteryLabel.textContent = has ? panel.masterySlider.value + '%' : '—';
+        };
     }
 
     // ── Panel lifecycle ──
@@ -486,10 +526,13 @@
         panel.hw.stop();
         panel.canvas.style.display = 'none';
 
-        // Hide highway-specific buttons
+        // Hide highway-specific buttons and mastery slider
         panel.invertBtn.style.display = 'none';
         panel.lyricsBtn.style.display = 'none';
         panel.tabBtn.style.display = 'none';
+        panel.masteryHeading.style.display = 'none';
+        panel.masterySlider.style.display = 'none';
+        panel.masteryLabel.style.display = 'none';
 
         panel.lyricsPane = createLyricsPane(panel.panelDiv);
         panel.lyricsPane.el.style.bottom = (panel.bar.offsetHeight || 28) + 'px';
@@ -513,12 +556,16 @@
         panel.invertBtn.style.display = '';
         panel.lyricsBtn.style.display = '';
         panel.tabBtn.style.display = '';
+        panel.masteryHeading.style.display = '';
+        panel.masterySlider.style.display = '';
+        panel.masteryLabel.style.display = '';
         panel.lyricsMode = false;
 
         panel.hw.init(panel.canvas);
         panel.hw.resize();
         panel.arrIndex = arrIndex;
         panel.arrName.textContent = arrangements[arrIndex]?.name || '';
+        hookPanelReady(panel);
         panel.hw.connect(getWsUrl(currentFilename, arrIndex), { onSongInfo: () => {} });
         savePanelPrefs();
     }
@@ -534,6 +581,9 @@
         panel.invertBtn.style.display = 'none';
         panel.lyricsBtn.style.display = 'none';
         panel.tabBtn.style.display = 'none';
+        panel.masteryHeading.style.display = 'none';
+        panel.masterySlider.style.display = 'none';
+        panel.masteryLabel.style.display = 'none';
 
         const jtContainer = document.createElement('div');
         jtContainer.style.cssText =
@@ -572,12 +622,16 @@
         panel.invertBtn.style.display = '';
         panel.lyricsBtn.style.display = '';
         panel.tabBtn.style.display = '';
+        panel.masteryHeading.style.display = '';
+        panel.masterySlider.style.display = '';
+        panel.masteryLabel.style.display = '';
         panel.jumpingTabMode = false;
 
         panel.hw.init(panel.canvas);
         panel.hw.resize();
         panel.arrIndex = arrIndex;
         panel.arrName.textContent = arrangements[arrIndex]?.name || '';
+        hookPanelReady(panel);
         panel.hw.connect(getWsUrl(currentFilename, arrIndex), { onSongInfo: () => {} });
         savePanelPrefs();
     }
@@ -596,6 +650,7 @@
         // Hand the panel's existing highway a 3D renderer, then connect so
         // the highway's WebSocket and RAF loop start feeding draw(bundle) calls.
         panel.hw.setRenderer(window.slopsmithViz_highway_3d());
+        hookPanelReady(panel);
         panel.hw.connect(getWsUrl(currentFilename, panel.arrIndex), { onSongInfo: () => {} });
         panel.hw3dMode = true;
 
@@ -625,6 +680,7 @@
 
         panel.arrIndex = arrIndex;
         panel.arrName.textContent = arrangements[arrIndex]?.name || '';
+        hookPanelReady(panel);
         panel.hw.connect(getWsUrl(currentFilename, arrIndex), { onSongInfo: () => {} });
 
         panel.updateInvertStyle(panel.hw.getInverted());
@@ -670,6 +726,16 @@
             }
         }
 
+        const savedMastery = (prefs?.mastery !== undefined) ? prefs.mastery : 1;
+        panel.hw.setMastery(savedMastery);
+        panel.masterySlider.value = Math.round(savedMastery * 100);
+        panel.masterySlider.oninput = () => {
+            const pct = parseInt(panel.masterySlider.value);
+            panel.hw.setMastery(pct / 100);
+            panel.masteryLabel.textContent = pct + '%';
+            savePanelPrefs();
+        };
+
         // Populate arrangement dropdown (includes Lyrics, JT, and 3D options)
         populateSelect(panel, arrIndex);
 
@@ -696,6 +762,7 @@
                 panel.arrIndex = d3Idx;
                 if (panel.hw3dMode) {
                     // Already in 3D — reconnect the highway to the new arrangement.
+                    hookPanelReady(panel);
                     panel.hw.connect(getWsUrl(currentFilename, d3Idx), { onSongInfo: () => {} });
                     panel.arrName.textContent = (arrangements[d3Idx]?.name || '') + ' (3D)';
                     savePanelPrefs();
@@ -781,6 +848,7 @@
             // default writes to shared HUD / audio / arrangement dropdown
             // — otherwise every panel's song_info clobbers the main view.
             // See byrongamatos/slopsmith#27.
+            hookPanelReady(panel);
             panel.hw.connect(getWsUrl(currentFilename, arrIndex), { onSongInfo: () => {} });
         }
     }
@@ -875,8 +943,8 @@
     function switchPanelArrangement(panel, arrIndex) {
         panel.arrIndex = arrIndex;
         panel.arrName.textContent = arrangements[arrIndex]?.name || '';
-        // If panel was in tab mode, drop out — the loaded GP5 is for the old arrangement.
         if (panel.tabActive) togglePanelTab(panel);
+        hookPanelReady(panel);
         panel.hw.reconnect(currentFilename, arrIndex);
     }
 
@@ -930,6 +998,7 @@
             inverted: p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
             barHidden: p.bar.style.display === 'none',
+            mastery: p.hw.getMastery(),
         }));
     }
 
@@ -1036,7 +1105,7 @@
         const controls = document.getElementById('player-controls');
         if (controls) {
             if (controlsHidden) controls.style.display = '';
-            controls.style.zIndex = '';
+            controls.style.zIndex = '10';  // keep controls above highway canvas at all times
             controls.style.marginTop = '';
         }
         controlsHidden = false;
@@ -1203,7 +1272,11 @@
 
     function injectBtn() {
         const c = document.getElementById('player-controls');
-        if (!c || document.getElementById('btn-splitscreen')) return;
+        if (!c) return;
+        // Keep controls above highway/3D canvas at all times regardless of split state.
+        c.style.position = 'relative';
+        c.style.zIndex = '10';
+        if (document.getElementById('btn-splitscreen')) return;
         const separator = c.querySelector('span.text-gray-700');
         const b = document.createElement('button');
         b.id = 'btn-splitscreen';
