@@ -454,6 +454,11 @@
         if (!wrap || !panels.length) return;
         const controls = document.getElementById('player-controls');
         const controlsH = controls ? controls.offsetHeight : 50;
+        // Make room for top-anchored siblings inside #player (e.g. the Section
+        // Map plugin's bar at top:0 z-index:5) so panels don't render under them.
+        const sm = document.getElementById('section-map');
+        const topOffset = sm ? sm.offsetHeight : 0;
+        wrap.style.top = topOffset + 'px';
         wrap.style.bottom = controlsH + 'px';
         for (const p of panels) {
             if (p.jumpingTabMode && p.jumpingTabPane) {
