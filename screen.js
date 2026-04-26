@@ -1129,6 +1129,10 @@
         active = true;
         updateBtn();
         setRedundantControlsHidden(true);
+        // HUD: visible while loaded; fades out when audio begins playback.
+        const audio = document.getElementById('audio');
+        if (audio && !audio.paused) fadeOutHud();
+        else showHud();
         savePanelPrefs();
 
         if (localStorage.getItem('splitscreenControlsHidden') === 'true') toggleControlsVisibility();
@@ -1142,6 +1146,7 @@
         teardownPanels();
         active = false;
         setRedundantControlsHidden(false);
+        restoreHud();
 
         // Restore default highway canvas and controls z-index
         const defaultCanvas = document.getElementById('highway');
@@ -1221,6 +1226,35 @@
         if (separator) c.insertBefore(layoutBtn, separator);
         return layoutBtn;
     }
+
+    // ── Player HUD fade (top-left song title fades out once playback begins) ──
+    function showHud() {
+        const hud = document.getElementById('player-hud');
+        if (!hud) return;
+        hud.style.transition = 'none';
+        hud.style.opacity = '1';
+    }
+
+    function fadeOutHud() {
+        const hud = document.getElementById('player-hud');
+        if (!hud) return;
+        hud.style.transition = 'opacity 1.5s ease-out';
+        hud.style.opacity = '0';
+    }
+
+    function restoreHud() {
+        const hud = document.getElementById('player-hud');
+        if (!hud) return;
+        hud.style.transition = '';
+        hud.style.opacity = '';
+    }
+
+    function onAudioPlay() {
+        if (active) fadeOutHud();
+    }
+
+    const _audio = document.getElementById('audio');
+    if (_audio) _audio.addEventListener('play', onAudioPlay);
 
     // ── Redundant main-bar controls (hidden while split is active because each
     // panel exposes its own arrangement / mastery / lyrics / viz controls) ──
