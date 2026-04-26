@@ -528,7 +528,6 @@
 
         // Hide highway-specific buttons and mastery slider
         panel.invertBtn.style.display = 'none';
-        panel.lyricsBtn.style.display = 'none';
         panel.tabBtn.style.display = 'none';
         panel.masteryHeading.style.display = 'none';
         panel.masterySlider.style.display = 'none';
@@ -554,7 +553,6 @@
 
         panel.canvas.style.display = '';
         panel.invertBtn.style.display = '';
-        panel.lyricsBtn.style.display = '';
         panel.tabBtn.style.display = '';
         panel.masteryHeading.style.display = '';
         panel.masterySlider.style.display = '';
@@ -579,7 +577,6 @@
         panel.canvas.style.display = 'none';
 
         panel.invertBtn.style.display = 'none';
-        panel.lyricsBtn.style.display = 'none';
         panel.tabBtn.style.display = 'none';
         panel.masteryHeading.style.display = 'none';
         panel.masterySlider.style.display = 'none';
@@ -620,7 +617,6 @@
 
         panel.canvas.style.display = '';
         panel.invertBtn.style.display = '';
-        panel.lyricsBtn.style.display = '';
         panel.tabBtn.style.display = '';
         panel.masteryHeading.style.display = '';
         panel.masterySlider.style.display = '';
@@ -643,7 +639,6 @@
         if (panel.jumpingTabMode) exitJumpingTabMode(panel, panel.arrIndex);
         if (panel.tabActive) togglePanelTab(panel);
 
-        panel.lyricsBtn.style.display = 'none';
         panel.tabBtn.style.display = 'none';
         panel.viewBtn.style.display = 'none';
 
@@ -675,7 +670,6 @@
         panel.hw.setRenderer(null);
         panel.hw3dMode = false;
 
-        panel.lyricsBtn.style.display = '';
         panel.tabBtn.style.display = '';
 
         panel.arrIndex = arrIndex;
