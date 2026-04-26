@@ -24,6 +24,7 @@
     const DETECT_CHANNEL_LABELS = { mono: 'M', left: 'L', right: 'R' };
 
     let active = false;
+    let controlsHidden = false;
     let layout = localStorage.getItem('splitscreenLayout') || 'top-bottom';
     let autoReactivate = localStorage.getItem('splitscreenAutoReactivate') === 'true';
     let alwaysSplit = localStorage.getItem('splitscreenAlwaysSplit') === 'true';
@@ -72,6 +73,7 @@
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
             inverted: p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
+            barHidden: p.bar.style.display === 'none',
         }));
         localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
     }
@@ -337,6 +339,7 @@
         bar.style.cssText =
             'position:absolute;bottom:0;left:0;right:0;' +
             'display:flex;align-items:center;gap:6px;padding:4px 8px;' +
+            'flex-wrap:nowrap;overflow:hidden;' +
             'background:rgba(8,8,16,0.85);z-index:5;';
 
         // Panel label
@@ -371,7 +374,7 @@
             btn.style.color = on ? '#fff' : '#9ca3af';
         };
 
-        const invertBtn = makeToggleBtn('Invert', 'auto');
+        const invertBtn = makeToggleBtn('Invert');
         const updateInvertStyle = (on) => styleToggle(invertBtn, on, '#4c1d95');
         updateInvertStyle(false);
         bar.appendChild(invertBtn);
@@ -400,10 +403,22 @@
         bar.appendChild(viewBtn);
 
         panelDiv.appendChild(bar);
+
+        const barToggleBtn = document.createElement('button');
+        barToggleBtn.style.cssText =
+            'position:absolute;bottom:0;right:0;z-index:6;' +
+            'display:flex;align-items:center;justify-content:center;' +
+            'padding:2px 6px;border-radius:4px 0 0 0;cursor:pointer;' +
+            'background:rgba(64,128,224,0.85);border:none;' +
+            'font-size:10px;color:#fff;line-height:1;';
+        barToggleBtn.textContent = '▾ Bar';
+        barToggleBtn.title = 'Hide panel controls';
+        panelDiv.appendChild(barToggleBtn);
+
         container.appendChild(panelDiv);
 
         return {
-            panelDiv, canvas, bar, select, arrName,
+            panelDiv, canvas, bar, barToggleBtn, select, arrName,
             invertBtn, updateInvertStyle,
             lyricsBtn, updateLyricsStyle,
             tabBtn, updateTabStyle,
@@ -914,6 +929,7 @@
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
             inverted: p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
+            barHidden: p.bar.style.display === 'none',
         }));
     }
 
@@ -971,7 +987,7 @@
                 const c = panel.canvas;
                 if (!c) return;
                 const rect = panel.panelDiv.getBoundingClientRect();
-                const barH = panel.bar.offsetHeight || 28;
+                const barH = panel.bar.style.display === 'none' ? 0 : (panel.bar.offsetHeight || 28);
                 const w = rect.width;
                 const h = Math.max(0, rect.height - barH);
                 c.style.width = w + 'px';
@@ -984,6 +1000,8 @@
             panels.push(panel);
             const panelPrefs = savedPrefs ? savedPrefs[i % savedPrefs.length] : null;
             initPanel(panel, arrDefaults[i], panelPrefs);
+            panel.barToggleBtn.onclick = () => togglePanelBar(panel);
+            if (panelPrefs?.barHidden) togglePanelBar(panel);
         }
 
         // Hide default highway canvas, ensure controls stay on top and at bottom
@@ -1001,6 +1019,8 @@
         updateBtn();
         savePanelPrefs();
 
+        if (localStorage.getItem('splitscreenControlsHidden') === 'true') toggleControlsVisibility();
+
         // Hook into the time sync loop
         startTimeSync();
     }
@@ -1015,9 +1035,11 @@
         if (defaultCanvas) defaultCanvas.style.display = '';
         const controls = document.getElementById('player-controls');
         if (controls) {
+            if (controlsHidden) controls.style.display = '';
             controls.style.zIndex = '';
             controls.style.marginTop = '';
         }
+        controlsHidden = false;
 
         updateBtn();
         stopTimeSync();
@@ -1087,11 +1109,96 @@
         return layoutBtn;
     }
 
+    // ── Hide/show controls bar ──
+    let hideBtn = null;
+    let floatBtn = null;
+
+    function createHideBtn() {
+        if (hideBtn) return hideBtn;
+        const c = document.getElementById('player-controls');
+        if (!c) return null;
+        hideBtn = document.createElement('button');
+        hideBtn.id = 'btn-splitscreen-hide-bar';
+        hideBtn.className = OFF_CLASS;
+        hideBtn.title = 'Hide controls bar';
+        hideBtn.style.display = 'none';
+        hideBtn.onclick = toggleControlsVisibility;
+        const closeBtn = c.querySelector('button[onclick*="showScreen"]');
+        if (closeBtn) {
+            closeBtn.classList.remove('ml-auto');
+            const wrapper = document.createElement('div');
+            wrapper.style.cssText = 'display:flex;gap:8px;margin-left:auto;align-items:center;';
+            c.insertBefore(wrapper, closeBtn);
+            wrapper.appendChild(hideBtn);
+            wrapper.appendChild(closeBtn);
+        } else {
+            c.appendChild(hideBtn);
+        }
+        return hideBtn;
+    }
+
+    function createFloatingShowBtn() {
+        if (floatBtn) return floatBtn;
+        const player = document.getElementById('player');
+        if (!player) return null;
+        floatBtn = document.createElement('button');
+        floatBtn.id = 'btn-splitscreen-float-controls';
+        floatBtn.textContent = '▴ Controls';
+        floatBtn.title = 'Show controls bar';
+        floatBtn.style.cssText =
+            'position:absolute;bottom:8px;right:8px;z-index:20;display:none;' +
+            'padding:4px 10px;border-radius:6px;font-size:11px;cursor:pointer;' +
+            'background:rgba(64,128,224,0.85);color:#fff;border:none;';
+        floatBtn.onclick = toggleControlsVisibility;
+        player.appendChild(floatBtn);
+        return floatBtn;
+    }
+
+    function togglePanelBar(panel) {
+        const hiding = panel.bar.style.display !== 'none';
+        panel.bar.style.display = hiding ? 'none' : '';
+        if (hiding) {
+            panel.barToggleBtn.textContent = '▴ Bar';
+            panel.barToggleBtn.title = 'Show panel controls';
+            panel.barToggleBtn.style.background = 'rgba(64,128,224,0.85)';
+            panel.barToggleBtn.style.color = '#fff';
+            panel.barToggleBtn.style.width = 'auto';
+            panel.barToggleBtn.style.padding = '0 6px';
+        } else {
+            panel.barToggleBtn.textContent = '▾';
+            panel.barToggleBtn.title = 'Hide panel controls';
+            panel.barToggleBtn.style.background = 'rgba(64,128,224,0.85)';
+            panel.barToggleBtn.style.color = '#fff';
+            panel.barToggleBtn.style.width = '';
+            panel.barToggleBtn.style.padding = '2px 6px';
+        }
+        if (panel.jumpingTabMode && panel.jumpingTabPane) {
+            panel.jumpingTabPane.resize();
+        } else if (!panel.lyricsMode) {
+            panel.hw.resize();
+        }
+        savePanelPrefs();
+    }
+
+    function toggleControlsVisibility() {
+        controlsHidden = !controlsHidden;
+        localStorage.setItem('splitscreenControlsHidden', controlsHidden);
+        const controls = document.getElementById('player-controls');
+        if (controls) controls.style.display = controlsHidden ? 'none' : '';
+        if (active) sizeCanvases();
+        updateBtn();
+    }
+
     // ── Toggle button ──
     function updateBtn() {
         const btn = document.getElementById('btn-splitscreen');
         if (btn) btn.className = active ? ON_CLASS : OFF_CLASS;
         if (layoutBtn) layoutBtn.style.display = active ? '' : 'none';
+        if (hideBtn) {
+            hideBtn.style.display = active ? '' : 'none';
+            hideBtn.textContent = controlsHidden ? '▴ Bar' : '▾ Bar';
+        }
+        if (floatBtn) floatBtn.style.display = (active && controlsHidden) ? '' : 'none';
     }
 
     function injectBtn() {
@@ -1106,6 +1213,8 @@
         b.onclick = toggle;
         if (separator) c.insertBefore(b, separator);
         createLayoutBtn();
+        createHideBtn();
+        createFloatingShowBtn();
     }
 
     // ── Resize handler ──

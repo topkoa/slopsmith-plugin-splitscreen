@@ -9,9 +9,12 @@ A plugin for [Slopsmith](https://github.com/byrongamatos/slopsmith) that shows 2
 - **Per-panel visualization picker** — each panel can independently run any installed `slopsmithViz` plugin (e.g. the 3D highway) alongside the default 2D highway
 - **Per-panel invert toggle** — flip individual panels between player and audience perspective independently
 - **Per-panel note detection** — each panel can independently detect notes from a specific audio input channel; pairs with the [Note Detect](https://github.com/byrongamatos/slopsmith-plugin-notedetect) plugin for multi-guitar setups
+- **Hide/show bottom controls bar** — click **▾ Bar** (next to Close) to collapse the global player controls and reclaim the vertical space; a floating **▴ Controls** pill restores them
+- **Hide/show per-panel mini bar** — each panel has a **▾ Bar** button pinned to its bottom-right corner to collapse that panel's controls independently; click **▴ Bar** to restore
 - **Smart defaults** — opens with lead → rhythm → bass auto-assigned across panels when those arrangements exist, wrapping to fill the rest
 - **Single shared audio** — all panels slave to the core `<audio>` element, so there's only one sound source and no drift between views
 - **Live layout switching** — change layout from the player toolbar without reloading the song; existing arrangement selections are preserved when panel counts match
+- **Persistent settings** — layout, per-panel arrangements, invert state, bar visibility, and controls bar visibility are all saved to `localStorage` and restored on the next visit
 
 ## Installation
 
@@ -29,6 +32,13 @@ docker compose restart
 4. Click **Split** again to return to the single-highway view.
 
 Split screen works with both PSARC and `.sloppak` songs — any song with more than one arrangement benefits.
+
+### Hiding controls for more screen space
+
+- **Bottom controls bar** — when splitscreen is active, a **▾ Bar** button appears next to the Close button. Click it to hide the player controls bar; panels expand to fill the freed space. A floating **▴ Controls** pill appears at the bottom-right of the player to bring the bar back.
+- **Per-panel mini bar** — each panel has a **▾ Bar** button pinned to its bottom-right corner. Click it to collapse that panel's mini controls (arrangement picker, Invert, Lyrics, Tab, etc.); the highway fills the full panel height. Click **▴ Bar** to restore.
+
+Both states are saved to `localStorage` and restored automatically the next time you activate splitscreen.
 
 ## Settings
 
