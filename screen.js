@@ -1128,6 +1128,7 @@
         sizeCanvases();
         active = true;
         updateBtn();
+        setRedundantControlsHidden(true);
         savePanelPrefs();
 
         if (localStorage.getItem('splitscreenControlsHidden') === 'true') toggleControlsVisibility();
@@ -1140,6 +1141,7 @@
         savePanelPrefs();
         teardownPanels();
         active = false;
+        setRedundantControlsHidden(false);
 
         // Restore default highway canvas and controls z-index
         const defaultCanvas = document.getElementById('highway');
@@ -1218,6 +1220,25 @@
         };
         if (separator) c.insertBefore(layoutBtn, separator);
         return layoutBtn;
+    }
+
+    // ── Redundant main-bar controls (hidden while split is active because each
+    // panel exposes its own arrangement / mastery / lyrics / viz controls) ──
+    const REDUNDANT_CONTROL_IDS = [
+        'arr-select',
+        'mastery-slider-label',
+        'mastery-slider',
+        'mastery-label',
+        'btn-lyrics',
+        'viz-picker-label',
+        'viz-picker',
+    ];
+
+    function setRedundantControlsHidden(hide) {
+        for (const id of REDUNDANT_CONTROL_IDS) {
+            const el = document.getElementById(id);
+            if (el) el.style.display = hide ? 'none' : '';
+        }
     }
 
     // ── Hide/show controls bar ──
