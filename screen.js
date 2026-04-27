@@ -33,6 +33,29 @@
     let currentFilename = null;
     let arrangements = []; // arrangement list from song_info
 
+    // Public API for plugins that want per-panel state (e.g. 3D Highway reads
+    // its per-panel palette/background settings via localStorage keys keyed
+    // by panel index, and calls panelIndexFor(canvas) to resolve which panel
+    // a canvas belongs to).
+    window.slopsmithSplitscreen = {
+        panelIndexFor(canvas) {
+            if (!active) return null;
+            for (let i = 0; i < panels.length; i++) {
+                if (panels[i].canvas === canvas) return i;
+            }
+            return null;
+        },
+    };
+
+    // 3D Highway palette IDs. Mirrors the PALETTES registry in the 3dhighway
+    // plugin's screen.js — kept as a plain list here to avoid a runtime
+    // dependency on the plugin being loaded.
+    const H3D_PALETTES = [
+        { id: 'default', label: 'Default' },
+        { id: 'neon',    label: 'Neon' },
+        { id: 'pastel',  label: 'Pastel' },
+    ];
+
     // ── Settings sync ──
     const layoutSelect = document.getElementById('splitscreen-default-layout');
     if (layoutSelect) {
@@ -403,6 +426,19 @@
         viewBtn.style.display = 'none';
         bar.appendChild(viewBtn);
 
+        const paletteSelect = document.createElement('select');
+        paletteSelect.title = '3D Highway palette (this panel only)';
+        paletteSelect.style.cssText =
+            'background:#1a1a2e;border:1px solid #333;border-radius:4px;' +
+            'padding:2px 4px;font-size:10px;color:#ccc;outline:none;display:none;';
+        for (const p of H3D_PALETTES) {
+            const opt = document.createElement('option');
+            opt.value = p.id;
+            opt.textContent = p.label;
+            paletteSelect.appendChild(opt);
+        }
+        bar.appendChild(paletteSelect);
+
         const masteryHeading = document.createElement('span');
         masteryHeading.style.cssText = 'font-size:10px;color:#6b7280;white-space:nowrap;';
         masteryHeading.textContent = 'Mastery';
@@ -446,6 +482,7 @@
             tabBtn, updateTabStyle,
             detectBtn, updateDetectStyle,
             channelBtn, viewBtn,
+            paletteSelect,
             masteryHeading, masterySlider, masteryLabel,
         };
     }
@@ -503,6 +540,42 @@
         hw.setMastery(mastery);
         hw.resize();
         panel.hw = hw;
+    }
+
+    // ── Per-panel 3D Highway palette ──
+    // The 3D plugin reads h3d_bg_panel<N>_palette from localStorage on every
+    // change event. Writing the per-panel key + re-firing the global setter
+    // (with the global's existing value) triggers _bgEmitChange, which causes
+    // each running 3D renderer to re-read settings — picking up the panel
+    // override we just wrote. No global state changes hands.
+    function _readPanelPalette(panelIdx) {
+        try {
+            return localStorage.getItem('h3d_bg_panel' + panelIdx + '_palette')
+                || localStorage.getItem('h3d_bg_palette')
+                || 'default';
+        } catch (_) {
+            return 'default';
+        }
+    }
+    function _writePanelPalette(panelIdx, value) {
+        try { localStorage.setItem('h3d_bg_panel' + panelIdx + '_palette', value); } catch (_) {}
+        if (typeof window.h3dBgSetPalette === 'function') {
+            const cur = (() => {
+                try { return localStorage.getItem('h3d_bg_palette') || 'default'; }
+                catch (_) { return 'default'; }
+            })();
+            window.h3dBgSetPalette(cur);
+        }
+    }
+    function showPaletteSelect(panel) {
+        const idx = panels.indexOf(panel);
+        if (idx === -1) return;
+        if (typeof window.slopsmithViz_highway_3d !== 'function') return;
+        panel.paletteSelect.value = _readPanelPalette(idx);
+        panel.paletteSelect.style.display = '';
+    }
+    function hidePaletteSelect(panel) {
+        panel.paletteSelect.style.display = 'none';
     }
 
     // ── Mastery slider helpers ──
@@ -573,6 +646,7 @@
         panel.masteryHeading.style.display = 'none';
         panel.masterySlider.style.display = 'none';
         panel.masteryLabel.style.display = 'none';
+        hidePaletteSelect(panel);
 
         panel.lyricsPane = createLyricsPane(panel.panelDiv);
         panel.lyricsPane.el.style.bottom = (panel.bar.offsetHeight || 28) + 'px';
@@ -622,6 +696,7 @@
         panel.masteryHeading.style.display = 'none';
         panel.masterySlider.style.display = 'none';
         panel.masteryLabel.style.display = 'none';
+        hidePaletteSelect(panel);
 
         const jtContainer = document.createElement('div');
         jtContainer.style.cssText =
@@ -689,6 +764,7 @@
         hookPanelReady(panel);
         panel.hw.connect(getWsUrl(currentFilename, panel.arrIndex), { onSongInfo: () => {} });
         panel.hw3dMode = true;
+        showPaletteSelect(panel);
 
         panel.updateInvertStyle(panel.hw.getInverted());
         panel.invertBtn.onclick = () => {
@@ -710,6 +786,7 @@
         // renderer which restores the 2D canvas display automatically.
         panel.hw.setRenderer(null);
         panel.hw3dMode = false;
+        hidePaletteSelect(panel);
 
         panel.tabBtn.style.display = '';
 
@@ -769,6 +846,12 @@
             panel.hw.setMastery(pct / 100);
             panel.masteryLabel.textContent = pct + '%';
             savePanelPrefs();
+        };
+
+        panel.paletteSelect.onchange = () => {
+            const idx = panels.indexOf(panel);
+            if (idx === -1) return;
+            _writePanelPalette(idx, panel.paletteSelect.value);
         };
 
         // Populate arrangement dropdown (includes Lyrics, JT, and 3D options)
