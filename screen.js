@@ -2256,6 +2256,8 @@
                     for (const p of panels) {
                         if (!p.lyricsMode && !p.jumpingTabMode) p.hw.setTime(msg.t);
                     }
+                    // Song-change toast lingers until playback begins.
+                    _maybeDismissFollowerToastOnPlay(msg.t);
                 } else if (msg.type === 'song-changed' && msg.filename && msg.filename !== currentFilename) {
                     _handleFollowerSongChange(msg.filename);
                 }
@@ -2373,6 +2375,166 @@
         teardownPanels();
         active = false;
         await loadSongInFollower(newFilename, cfgs);
+        // Briefly surface what the new song is so the popup viewer
+        // (often on a second monitor, away from the main window's HUD)
+        // sees the title / artist / tuning / per-panel arrangement
+        // before notes start scrolling.
+        _showFollowerSongToast(highway.getSongInfo());
+    }
+
+    // ── Song-change toast (popup only) ────────────────────────────────
+    // An overlay shown right after _handleFollowerSongChange finishes
+    // rebuilding the panels. Stays visible until the main window starts
+    // playback (detected by time-broadcasts advancing past the baseline
+    // captured at toast-creation). Replaces any prior toast in flight
+    // so a rapid sequence of song changes doesn't pile up.
+    const FOLLOWER_TOAST_FADE_MS = 400;
+    // Time threshold (seconds) the broadcast `t` must exceed beyond the
+    // baseline captured when the toast was shown, before we treat the
+    // song as "started." 50ms covers floating-point slop and the 60Hz
+    // broadcast interval (~17ms) without flapping.
+    const FOLLOWER_TOAST_PLAY_THRESHOLD_S = 0.05;
+    let _followerToast = null;
+    let _followerToastBaselineTime = 0;
+
+    // Common-tuning name resolver. Order-agnostic — works whether the
+    // tuning array is high-to-low or low-to-high (we test both ends for
+    // the drop pattern). Returns null for anything that isn't a flat
+    // uniform offset or a one-string drop variant; the caller falls
+    // back to displaying raw offsets in that case.
+    function _resolveFollowerTuningName(tuning) {
+        if (!Array.isArray(tuning) || tuning.length === 0) return null;
+        const STANDARD_NAMES = {
+            '0':  'E Standard',
+            '-1': 'Eb Standard',
+            '-2': 'D Standard',
+            '-3': 'C# Standard',
+            '-4': 'C Standard',
+            '2':  'F# Standard',
+        };
+        const DROP_NAMES = {
+            '0':  'Drop D',
+            '-1': 'Drop Db',
+            '-2': 'Drop C',
+            '-3': 'Drop B',
+            '-4': 'Drop Bb',
+        };
+        const allEqual = tuning.every(t => t === tuning[0]);
+        if (allEqual) return STANDARD_NAMES[String(tuning[0])] || null;
+        // One-string drop: low string is 2 semitones below an otherwise-
+        // uniform offset. Test both possible orientations of the array.
+        const last = tuning.length - 1;
+        const headEqual = tuning.slice(0, last).every(t => t === tuning[0]);
+        if (headEqual && tuning[last] === tuning[0] - 2) {
+            return DROP_NAMES[String(tuning[0])] || null;
+        }
+        const tail = tuning.slice(1);
+        const tailEqual = tail.every(t => t === tail[0]);
+        if (tailEqual && tuning[0] === tail[0] - 2) {
+            return DROP_NAMES[String(tail[0])] || null;
+        }
+        return null;
+    }
+
+    function _dismissFollowerToast() {
+        if (!_followerToast) return;
+        const toast = _followerToast;
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(-50%) translateY(-12px)';
+        setTimeout(() => {
+            if (_followerToast === toast) _followerToast = null;
+            toast.remove();
+        }, FOLLOWER_TOAST_FADE_MS);
+    }
+
+    // Called from the time-broadcast handler. Dismisses the toast the
+    // first time the main window's audio.currentTime advances past the
+    // baseline captured at toast-creation — i.e. play has actually
+    // started. While main is paused at the new song's start (t = 0),
+    // every broadcast carries the same t and the toast stays visible.
+    function _maybeDismissFollowerToastOnPlay(t) {
+        if (!_followerToast) return;
+        if (t > _followerToastBaselineTime + FOLLOWER_TOAST_PLAY_THRESHOLD_S) {
+            _dismissFollowerToast();
+        }
+    }
+
+    function _showFollowerSongToast(info) {
+        if (!info) return;
+        // Replace any existing toast (rapid song-change sequence).
+        if (_followerToast) { _followerToast.remove(); _followerToast = null; }
+
+        const toast = document.createElement('div');
+        toast.id = 'follower-song-toast';
+        toast.style.cssText =
+            'position:fixed;top:24px;left:50%;' +
+            'transform:translateX(-50%) translateY(-12px);' +
+            'min-width:280px;max-width:80vw;padding:14px 22px;' +
+            'background:rgba(8,8,16,0.95);border:1px solid #4080e0;border-radius:8px;' +
+            'box-shadow:0 6px 20px rgba(0,0,0,0.55);' +
+            'z-index:10002;font-family:sans-serif;color:#e5e7eb;text-align:center;' +
+            'opacity:0;transition:opacity ' + FOLLOWER_TOAST_FADE_MS + 'ms ease,' +
+            'transform ' + FOLLOWER_TOAST_FADE_MS + 'ms ease;' +
+            'pointer-events:none;';
+
+        const title = document.createElement('div');
+        title.style.cssText = 'font-size:18px;font-weight:600;color:#fff;line-height:1.25;';
+        title.textContent = info.title || 'Untitled';
+        toast.appendChild(title);
+
+        if (info.artist) {
+            const artist = document.createElement('div');
+            artist.style.cssText = 'font-size:13px;color:#9ca3af;margin-top:2px;';
+            artist.textContent = info.artist;
+            toast.appendChild(artist);
+        }
+
+        const detailLines = [];
+        const tuningName = _resolveFollowerTuningName(info.tuning);
+        if (tuningName) detailLines.push('Tuning: ' + tuningName);
+        else if (Array.isArray(info.tuning) && info.tuning.length > 0) {
+            detailLines.push('Tuning: [' + info.tuning.join(', ') + ']');
+        }
+        if (Number.isFinite(info.capo) && info.capo > 0) detailLines.push('Capo: ' + info.capo);
+
+        if (detailLines.length > 0) {
+            const details = document.createElement('div');
+            details.style.cssText = 'font-size:12px;color:#9ca3af;margin-top:8px;line-height:1.5;';
+            details.textContent = detailLines.join(' · ');
+            toast.appendChild(details);
+        }
+
+        // Per-panel arrangement breakdown — only shown when there are 2+
+        // panels in the popup, since a single panel is self-evident
+        // from the highway already visible behind the toast.
+        if (panels.length > 1) {
+            const panelInfo = document.createElement('div');
+            panelInfo.style.cssText = 'font-size:11px;color:#9ca3af;margin-top:6px;line-height:1.4;';
+            const panelLabels = panels.map((p, idx) => {
+                const arrName = arrangements[p.arrIndex]?.name || 'Arr ' + p.arrIndex;
+                const modeSuffix = p.lyricsMode ? ' (Lyrics)'
+                    : p.jumpingTabMode ? ' (JT)'
+                    : p.hw3dMode ? ' (3D)'
+                    : '';
+                return 'P' + (idx + 1) + ': ' + arrName + modeSuffix;
+            });
+            panelInfo.textContent = panelLabels.join(' · ');
+            toast.appendChild(panelInfo);
+        }
+
+        document.body.appendChild(toast);
+        _followerToast = toast;
+        // Snapshot the current broadcast time so we can detect playback
+        // starting later. While main is paused, time messages keep
+        // arriving with this same value and the toast stays visible.
+        _followerToastBaselineTime = _followerCurrentTime;
+
+        // Animate in next frame so the initial opacity:0 / translateY
+        // styles take effect before the transition kicks in.
+        requestAnimationFrame(() => {
+            toast.style.opacity = '1';
+            toast.style.transform = 'translateX(-50%) translateY(0)';
+        });
     }
 
     // Kick off follower-mode bootstrap — placed at the very end of the IIFE
