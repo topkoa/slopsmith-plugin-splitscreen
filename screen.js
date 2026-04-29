@@ -2027,25 +2027,32 @@
         // finished installing their playSong wraps and globals.
         requestAnimationFrame(() => {
             if (typeof window.showScreen === 'function') window.showScreen('player');
-            loadSongInFollower(FOLLOWER.filename, FOLLOWER);
+            loadSongInFollower(FOLLOWER.filename, [FOLLOWER]);
         });
     }
 
     // Load `filename` in the popup, wait for it to be ready, then build the
-    // follower panel from `cfg`. Used both on initial bootstrap (cfg = the
-    // FOLLOWER config from URL params) and on song-change (cfg = freshly
-    // captured from the current panel state).
-    async function loadSongInFollower(filename, cfg) {
-        // Pre-seed per-panel 3D settings (slot 0 in popup) BEFORE the
-        // renderer first reads them.
-        if (cfg.palette) {
-            try { localStorage.setItem('h3d_bg_panel0_palette', cfg.palette); } catch (_) {}
+    // follower panels from `cfgs`. Used both on initial bootstrap
+    // (cfgs = [FOLLOWER]) and on song-change (cfgs = current panel states).
+    // The popup's main highway is shared across all panels for time / song
+    // info purposes; per-panel arrangement is set inside each panel's own
+    // WebSocket via initPanel.
+    async function loadSongInFollower(filename, cfgs) {
+        // Pre-seed per-panel 3D settings (palette, cameraSmoothing) for
+        // every slot BEFORE the renderer first reads them.
+        for (let i = 0; i < cfgs.length; i++) {
+            const cfg = cfgs[i];
+            if (!cfg) continue;
+            if (cfg.palette) {
+                try { localStorage.setItem('h3d_bg_panel' + i + '_palette', cfg.palette); } catch (_) {}
+            }
+            if (Number.isFinite(cfg.cameraSmoothing)) {
+                try { localStorage.setItem('h3d_bg_panel' + i + '_cameraSmoothing', String(cfg.cameraSmoothing)); } catch (_) {}
+            }
         }
-        if (Number.isFinite(cfg.cameraSmoothing)) {
-            try { localStorage.setItem('h3d_bg_panel0_cameraSmoothing', String(cfg.cameraSmoothing)); } catch (_) {}
-        }
+        const firstArr = (cfgs[0] && cfgs[0].arrangement) || 0;
         try {
-            await window.playSong(filename, cfg.arrangement);
+            await window.playSong(filename, firstArr);
         } catch (e) {
             console.error('[splitscreen-follower] playSong failed:', e);
             return;
@@ -2056,7 +2063,14 @@
         // should still be in place, but cheap to re-confirm.
         if (_followerAudio) { _followerAudio.muted = true; _followerAudio.volume = 0; }
         await waitForHighwayReady();
-        buildFollowerPanel(cfg);
+        // Honour the user's chosen layout (default 'follower' = single).
+        // Pad cfgs with null so any extra slots get smart defaults inside
+        // buildFollowerLayout.
+        const needed = FOLLOWER_LAYOUT_PANELS[_followerLayoutKey] || 1;
+        const padded = cfgs.slice();
+        for (let i = padded.length; i < needed; i++) padded.push(null);
+        buildFollowerLayout(padded, _followerLayoutKey);
+        _buildFollowerToolbar();
     }
 
     function waitForHighwayReady() {
@@ -2086,51 +2100,28 @@
         });
     }
 
-    function buildFollowerPanel(cfg) {
-        const info = highway.getSongInfo();
-        if (info && info.arrangements) arrangements = info.arrangements;
-        // Clamp the arrangement index against the new song's arrangement
-        // count — protects against an out-of-range arrIndex when main
-        // switches to a song with fewer arrangements.
-        const arrIdx = (cfg.arrangement >= 0 && cfg.arrangement < arrangements.length)
-            ? cfg.arrangement
-            : 0;
+    // ── Follower layout state ─────────────────────────────────────────
+    // The popup window can split itself the same way main can: 'follower'
+    // (single full-window panel, default), 'top-bottom' (2 stacked),
+    // 'left-right' (2 side-by-side), 'quad' (2x2). The layout is picked
+    // from a selector in the popup's bottom toolbar.
+    const FOLLOWER_LAYOUT_PANELS = {
+        'follower':   1,
+        'top-bottom': 2,
+        'left-right': 2,
+        'quad':       4,
+    };
+    let _followerLayoutKey = 'follower';
+    const FOLLOWER_TOOLBAR_H = 32;
 
-        // Build a full-viewport wrap. Reuse #splitscreen-wrap id so any
-        // CSS selectors / lookups elsewhere find it the same way.
-        const followerWrap = document.createElement('div');
-        followerWrap.id = 'splitscreen-wrap';
-        followerWrap.style.cssText = 'position:fixed;inset:0;background:#000;z-index:9999;';
-        document.body.appendChild(followerWrap);
-        wrap = followerWrap;
-
-        const parts = createPanel(0, followerWrap, 'follower');
-        const hw = createHighway();
-        const panel = Object.assign({ hw, arrIndex: 0 }, parts);
-
-        // Same hw.resize override pattern startSplitScreen() uses, so the
-        // follower window resizing recomputes the canvas dims correctly.
-        hw.resize = function () {
-            const c = panel.canvas;
-            if (!c) return;
-            const rect = panel.panelDiv.getBoundingClientRect();
-            const barH = panel.bar.style.display === 'none' ? 0 : (panel.bar.offsetHeight || 28);
-            const w = rect.width;
-            const h = Math.max(0, rect.height - barH);
-            c.style.width = w + 'px';
-            c.style.height = h + 'px';
-            const scale = hw.getRenderScale();
-            c.width = Math.round(w * scale);
-            c.height = Math.round(h * scale);
-        };
-
-        panels.push(panel);
-
+    // Convert a captured panel config (cfg) and arrIdx into the prefs
+    // shape that initPanel expects.
+    function _followerCfgToPrefs(cfg, arrIdx) {
         const arrName = (cfg.mode === 'lyrics') ? LYRICS_VALUE
             : (cfg.mode === 'jt') ? (JUMPING_TAB_VALUE + ':' + (arrangements[arrIdx]?.name || ''))
             : (cfg.mode === '3d') ? (HW3D_VALUE + ':' + (arrangements[arrIdx]?.name || ''))
             : (arrangements[arrIdx]?.name || '');
-        const prefs = {
+        return {
             arrName,
             lyrics: true,
             inverted: !!cfg.inverted,
@@ -2138,23 +2129,105 @@
             barHidden: false,
             mastery: Number.isFinite(cfg.mastery) ? cfg.mastery : 1,
         };
+    }
 
-        initPanel(panel, arrIdx, prefs);
+    // Build N panels per `layoutKey` into the wrap div. `cfgs` is an array
+    // of panel configs (one per slot); slots beyond cfgs.length get smart
+    // defaults via getDefaultArrangements. Replaces the older single-panel
+    // buildFollowerPanel so the popup can host any of the standard layouts.
+    function buildFollowerLayout(cfgs, layoutKey) {
+        layoutKey = FOLLOWER_LAYOUT_PANELS[layoutKey] ? layoutKey : 'follower';
+        _followerLayoutKey = layoutKey;
+        const panelCount = FOLLOWER_LAYOUT_PANELS[layoutKey];
+
+        const info = highway.getSongInfo();
+        if (info && info.arrangements) arrangements = info.arrangements;
+
+        // Build the full-viewport wrap. Reuse the #splitscreen-wrap id so
+        // any selectors elsewhere find it identically. We leave room at
+        // the bottom for the follower toolbar.
+        const followerWrap = document.createElement('div');
+        followerWrap.id = 'splitscreen-wrap';
+        followerWrap.style.cssText =
+            'position:fixed;top:0;left:0;right:0;bottom:' + FOLLOWER_TOOLBAR_H + 'px;' +
+            'background:#000;z-index:9999;display:flex;';
+        if (layoutKey === 'top-bottom') {
+            followerWrap.style.flexDirection = 'column';
+        } else if (layoutKey === 'left-right') {
+            followerWrap.style.flexDirection = 'row';
+        } else if (layoutKey === 'quad') {
+            followerWrap.style.flexDirection = 'row';
+            followerWrap.style.flexWrap = 'wrap';
+        } else {
+            // single (follower)
+            followerWrap.style.flexDirection = 'column';
+        }
+        document.body.appendChild(followerWrap);
+        wrap = followerWrap;
+
+        // Smart-default arrangement indices for slots beyond the explicit
+        // cfgs (e.g. when user widens 1 → 4, slots 1..3 get lead/rhythm/bass
+        // assignments via the same helper main uses).
+        const defaultArrs = getDefaultArrangements(panelCount);
+
+        for (let i = 0; i < panelCount; i++) {
+            // Pick the layoutKey passed to createPanel so panel sizing is
+            // correct: 'follower' for single, otherwise the layout name.
+            const panelLayoutKey = (panelCount === 1) ? 'follower' : layoutKey;
+            const parts = createPanel(i, followerWrap, panelLayoutKey);
+            const hw = createHighway();
+            const panel = Object.assign({ hw, arrIndex: 0 }, parts);
+
+            // Same hw.resize override pattern startSplitScreen() uses.
+            hw.resize = function () {
+                const c = panel.canvas;
+                if (!c) return;
+                const rect = panel.panelDiv.getBoundingClientRect();
+                const barH = panel.bar.style.display === 'none' ? 0 : (panel.bar.offsetHeight || 28);
+                const w = rect.width;
+                const h = Math.max(0, rect.height - barH);
+                c.style.width = w + 'px';
+                c.style.height = h + 'px';
+                const scale = hw.getRenderScale();
+                c.width = Math.round(w * scale);
+                c.height = Math.round(h * scale);
+            };
+
+            panels.push(panel);
+
+            // Pick this slot's config: explicit if cfgs has it, else smart default.
+            const cfg = cfgs[i] || {
+                arrangement: defaultArrs[i] || 0,
+                mode: '2d',
+                inverted: 0,
+                mastery: 1,
+            };
+            const arrIdx = (cfg.arrangement >= 0 && cfg.arrangement < arrangements.length)
+                ? cfg.arrangement : 0;
+            initPanel(panel, arrIdx, _followerCfgToPrefs(cfg, arrIdx));
+
+            // Wire the panel's bar-toggle button. startSplitScreen() does
+            // this in main; follower-mode panels need the same hookup or
+            // the per-panel ▾ Bar button is dead.
+            panel.barToggleBtn.onclick = () => togglePanelBar(panel);
+        }
+
         active = true;
-        panel.hw.resize();
+        for (const p of panels) p.hw.resize();
 
-        // Subscribe to messages from the main window. The listener handles
-        // both per-frame time updates and song-change events. We replace
-        // the channel handler each rebuild so the closure captures the
-        // current `panel`; previous panel references are dropped along
-        // with the old DOM in teardownPanels().
+        // Subscribe to the broadcast channel for time + song-change. Fans
+        // out time updates to every panel; the listener captures `panels`
+        // by reference so subsequent rebuilds (which mutate panels in
+        // place via teardownPanels + push) automatically see new panels.
         const ch = _ssChannel();
         if (ch) {
             ch.onmessage = (ev) => {
                 const msg = ev.data || {};
                 if (msg.type === 'time' && Number.isFinite(msg.t)) {
                     _followerCurrentTime = msg.t;
-                    if (!panel.lyricsMode && !panel.jumpingTabMode) panel.hw.setTime(msg.t);
+                    for (const p of panels) {
+                        if (!p.lyricsMode && !p.jumpingTabMode) p.hw.setTime(msg.t);
+                    }
                 } else if (msg.type === 'song-changed' && msg.filename && msg.filename !== currentFilename) {
                     _handleFollowerSongChange(msg.filename);
                 }
@@ -2162,37 +2235,116 @@
         }
     }
 
-    // Capture the panel's current state for a song-change rebuild. Reads
-    // from the live panel (so any user changes since pop-out are honoured)
-    // and from per-panel localStorage (palette + smoothing, in case the
-    // user dialled them in the popup).
-    function _captureCurrentFollowerConfig() {
-        const p = panels[0];
-        const out = {
-            arrangement:     p ? (p.arrIndex || 0) : 0,
-            mode:            p ? _captureMode(p) : (FOLLOWER ? FOLLOWER.mode : '2d'),
-            inverted:        p ? (p.hw.getInverted() ? 1 : 0) : 0,
-            mastery:         p ? p.hw.getMastery() : 1,
-        };
-        try {
-            const v = localStorage.getItem('h3d_bg_panel0_palette');
-            if (v) out.palette = v;
-        } catch (_) {}
-        try {
-            const v = localStorage.getItem('h3d_bg_panel0_cameraSmoothing');
-            if (v != null) out.cameraSmoothing = parseFloat(v);
-        } catch (_) {}
-        return out;
+    // Bottom toolbar inside the popup window: layout picker + dock-all.
+    // Built once per popup, the layout selector triggers rebuild of the
+    // panel grid.
+    let _followerToolbar = null;
+    function _buildFollowerToolbar() {
+        if (_followerToolbar) return _followerToolbar;
+        const bar = document.createElement('div');
+        bar.id = 'follower-toolbar';
+        bar.style.cssText =
+            'position:fixed;bottom:0;left:0;right:0;height:' + FOLLOWER_TOOLBAR_H + 'px;' +
+            'display:flex;align-items:center;gap:10px;padding:0 10px;' +
+            'background:rgba(8,8,16,0.95);border-top:1px solid #1f2937;' +
+            'z-index:10001;font-family:sans-serif;color:#9ca3af;font-size:12px;';
+
+        const label = document.createElement('span');
+        label.textContent = 'Layout';
+        label.style.cssText = 'font-size:11px;color:#6b7280;';
+        bar.appendChild(label);
+
+        const sel = document.createElement('select');
+        sel.id = 'follower-layout-select';
+        sel.style.cssText =
+            'background:#1a1a2e;border:1px solid #333;border-radius:4px;' +
+            'padding:3px 6px;font-size:12px;color:#ccc;outline:none;';
+        const options = [
+            { value: 'follower',   label: '⬜ Single' },
+            { value: 'top-bottom', label: '⬒ Top/Bottom' },
+            { value: 'left-right', label: '⬓ Left/Right' },
+            { value: 'quad',       label: '⊞ Quad' },
+        ];
+        for (const o of options) {
+            const opt = document.createElement('option');
+            opt.value = o.value;
+            opt.textContent = o.label;
+            if (o.value === _followerLayoutKey) opt.selected = true;
+            sel.appendChild(opt);
+        }
+        sel.onchange = () => rebuildFollowerLayout(sel.value);
+        bar.appendChild(sel);
+
+        document.body.appendChild(bar);
+        _followerToolbar = bar;
+        return bar;
     }
 
-    // Rebuild the follower panel for a new song while preserving the
-    // user's mode + arrangement choice. Triggered by the main window's
-    // `song-changed` broadcast.
-    async function _handleFollowerSongChange(newFilename) {
-        const cfg = _captureCurrentFollowerConfig();
+    // Rebuild the popup's panel grid into a new layout. Captures the
+    // current panels' configs so existing slots survive the change; new
+    // slots fill with smart defaults via getDefaultArrangements.
+    function rebuildFollowerLayout(newLayoutKey) {
+        if (!FOLLOWER_LAYOUT_PANELS[newLayoutKey]) return;
+        if (newLayoutKey === _followerLayoutKey && panels.length === FOLLOWER_LAYOUT_PANELS[newLayoutKey]) return;
+
+        // Capture current panel configs (in slot order) so the rebuilt
+        // grid keeps existing arrangement / mode / inverted / mastery.
+        const cfgs = panels.map((p, idx) => {
+            const out = {
+                arrangement: p.arrIndex || 0,
+                mode:        _captureMode(p),
+                inverted:    p.hw.getInverted() ? 1 : 0,
+                mastery:     p.hw.getMastery(),
+            };
+            try {
+                const v = localStorage.getItem('h3d_bg_panel' + idx + '_palette');
+                if (v) out.palette = v;
+            } catch (_) {}
+            try {
+                const v = localStorage.getItem('h3d_bg_panel' + idx + '_cameraSmoothing');
+                if (v != null) out.cameraSmoothing = parseFloat(v);
+            } catch (_) {}
+            return out;
+        });
+
         teardownPanels();
         active = false;
-        await loadSongInFollower(newFilename, cfg);
+        buildFollowerLayout(cfgs, newLayoutKey);
+    }
+
+    // Capture every popup panel's current state into an array of cfgs,
+    // suitable for handing back to loadSongInFollower / buildFollowerLayout.
+    // Reads from the live panels (so any user changes since pop-out /
+    // last layout change are honoured) and from per-panel localStorage
+    // (palette + smoothing, in case the user dialled them in the popup).
+    function _captureAllFollowerConfigs() {
+        return panels.map((p, idx) => {
+            const out = {
+                arrangement: p.arrIndex || 0,
+                mode:        _captureMode(p),
+                inverted:    p.hw.getInverted() ? 1 : 0,
+                mastery:     p.hw.getMastery(),
+            };
+            try {
+                const v = localStorage.getItem('h3d_bg_panel' + idx + '_palette');
+                if (v) out.palette = v;
+            } catch (_) {}
+            try {
+                const v = localStorage.getItem('h3d_bg_panel' + idx + '_cameraSmoothing');
+                if (v != null) out.cameraSmoothing = parseFloat(v);
+            } catch (_) {}
+            return out;
+        });
+    }
+
+    // Rebuild the follower panels for a new song while preserving the
+    // user's layout + per-panel mode + arrangement choices. Triggered by
+    // the main window's `song-changed` broadcast.
+    async function _handleFollowerSongChange(newFilename) {
+        const cfgs = _captureAllFollowerConfigs();
+        teardownPanels();
+        active = false;
+        await loadSongInFollower(newFilename, cfgs);
     }
 
     // Kick off follower-mode bootstrap — placed at the very end of the IIFE
