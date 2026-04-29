@@ -1870,8 +1870,15 @@
     }
 
     // ── Resize handler ──
+    // sizeCanvases() is for main-window splitscreen — it reads the global
+    // #player-controls height to compute the wrap's bottom offset. In a
+    // popup #player-controls is force-hidden, so offsetHeight is 0 and
+    // sizeCanvases would clobber the follower wrap's `bottom: FOLLOWER_TOOLBAR_H`
+    // reservation, sliding the wrap (and every panel's bar) under the
+    // follower toolbar. Follower mode has its own resize handler in
+    // bootFollowerMode that resizes panels without touching the wrap.
     window.addEventListener('resize', () => {
-        if (active) sizeCanvases();
+        if (active && !FOLLOWER) sizeCanvases();
     });
 
     // ── Hook into playSong ──
@@ -2017,10 +2024,17 @@
             } catch (_) {}
         });
 
-        // Resize handler: panels[0] is always the live follower panel after
-        // any song-change rebuild, so this single listener stays correct.
+        // Resize handler: walk every live panel — multi-panel popups
+        // (top-bottom, left-right, quad) need each highway / JT pane
+        // resized, not just panels[0]. Mirrors sizeCanvases()'s loop
+        // shape but doesn't touch wrap positioning (the follower wrap's
+        // top/bottom are set once at build time and don't need to track
+        // window chrome the way the main-window wrap does).
         window.addEventListener('resize', () => {
-            if (panels[0]) panels[0].hw.resize();
+            for (const p of panels) {
+                if (p.jumpingTabMode && p.jumpingTabPane) p.jumpingTabPane.resize();
+                else if (!p.lyricsMode) p.hw.resize();
+            }
         });
 
         // Wait one frame so all plugin IIFEs that loaded before us have
@@ -2146,22 +2160,36 @@
         // Build the full-viewport wrap. Reuse the #splitscreen-wrap id so
         // any selectors elsewhere find it identically. We leave room at
         // the bottom for the follower toolbar.
+        //
+        // Block layout for single-panel mode, flex for multi-panel. With
+        // a single child at width/height: 100%, the flexbox algorithm
+        // doesn't reliably resolve the main-axis size — height: 100%
+        // can collapse to the child's content height. That made the
+        // panelDiv bounding rect 0-tall on first measure, the bar
+        // (position:absolute; bottom:0) got clipped by the panel's
+        // overflow:hidden, and the per-panel control bar appeared
+        // missing. Block positioning (matches the original
+        // buildFollowerPanel behavior) sizes height: 100% against the
+        // position:fixed parent's definite dimensions cleanly. Multi-
+        // panel layouts use 50% sizes which the flex algorithm resolves
+        // fine, so they keep the flex container.
         const followerWrap = document.createElement('div');
         followerWrap.id = 'splitscreen-wrap';
         followerWrap.style.cssText =
             'position:fixed;top:0;left:0;right:0;bottom:' + FOLLOWER_TOOLBAR_H + 'px;' +
-            'background:#000;z-index:9999;display:flex;';
+            'background:#000;z-index:9999;';
         if (layoutKey === 'top-bottom') {
+            followerWrap.style.display = 'flex';
             followerWrap.style.flexDirection = 'column';
         } else if (layoutKey === 'left-right') {
+            followerWrap.style.display = 'flex';
             followerWrap.style.flexDirection = 'row';
         } else if (layoutKey === 'quad') {
+            followerWrap.style.display = 'flex';
             followerWrap.style.flexDirection = 'row';
             followerWrap.style.flexWrap = 'wrap';
-        } else {
-            // single (follower)
-            followerWrap.style.flexDirection = 'column';
         }
+        // else: single (follower) — leave as block layout (no flex).
         document.body.appendChild(followerWrap);
         wrap = followerWrap;
 
