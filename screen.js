@@ -33,6 +33,54 @@
     let currentFilename = null;
     let arrangements = []; // arrangement list from song_info
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  Pop-out / follower-mode (multi-monitor support).
+    //
+    //  When the user clicks "Pop Out" on a panel in the main window, we open
+    //  this same slopsmith app in a new browser window with `ssFollower=1`
+    //  and a serialized panel config in URL params. The popup boots normally
+    //  (loads app.js + all plugins) but the splitscreen IIFE detects the
+    //  follower flag and instead of running the usual auto-Split UI, it
+    //  builds a single full-window panel slaved to the main window's audio
+    //  via BroadcastChannel('slopsmith-ss').
+    //
+    //  popups: in the main window, tracks every popup we've spawned so we
+    //  can re-instate the panel when the popup posts a `docked` message.
+    //  Keyed by popupId. { panelIdx, originalConfig }.
+    //
+    //  FOLLOWER: parsed once on script load. Truthy in the popup window
+    //  only. Carries the panel config received from the opener.
+    // ══════════════════════════════════════════════════════════════════════
+    const popups = new Map();
+    const FOLLOWER = (function () {
+        try {
+            const params = new URLSearchParams(window.location.search);
+            if (params.get('ssFollower') !== '1') return null;
+            const cfg = {
+                popupId:         params.get('popupId') || '',
+                filename:        params.get('filename') || '',
+                arrangement:     parseInt(params.get('arrangement'), 10) || 0,
+                mode:            params.get('mode') || '2d',
+                inverted:        params.get('inverted') === '1',
+                mastery:         parseFloat(params.get('mastery')),
+                palette:         params.get('palette') || '',
+                cameraSmoothing: parseFloat(params.get('cameraSmoothing')),
+            };
+            if (!cfg.filename) return null;
+            return cfg;
+        } catch (_) {
+            return null;
+        }
+    })();
+    const SS_CHANNEL_NAME = 'slopsmith-ss';
+    let ssChannel = null;       // shared BroadcastChannel (lazily opened)
+    function _ssChannel() {
+        if (!ssChannel && typeof BroadcastChannel === 'function') {
+            ssChannel = new BroadcastChannel(SS_CHANNEL_NAME);
+        }
+        return ssChannel;
+    }
+
     // Public API for plugins that want per-panel state (e.g. 3D Highway reads
     // its per-panel palette/background settings via localStorage keys keyed
     // by panel index, and calls panelIndexFor(canvas) to resolve which panel
@@ -349,6 +397,9 @@
         } else if (layoutKey === 'left-right') {
             panelDiv.style.width = '50%';
             panelDiv.style.height = '100%';
+        } else if (layoutKey === 'follower') {
+            panelDiv.style.width = '100%';
+            panelDiv.style.height = '100%';
         } else {
             panelDiv.style.width = '100%';
             panelDiv.style.height = '50%';
@@ -485,6 +536,25 @@
         masteryLabel.textContent = '—';
         bar.appendChild(masteryLabel);
 
+        // Pop Out / Dock — visibility flips by mode (FOLLOWER => Dock; main => Pop Out).
+        // The actual click handlers are wired in initPanel() so they have access
+        // to the panel object via closure. We append at the end of the bar
+        // (no `margin-left:auto` because barToggleBtn lives absolute-positioned
+        // at bottom:0;right:0 and the auto-margin would collide with it).
+        const popOutBtn = document.createElement('button');
+        popOutBtn.style.cssText =
+            'padding:2px 6px;border-radius:4px;font-size:10px;' +
+            'border:1px solid #333;cursor:pointer;background:#1a1a2e;color:#9ca3af;' +
+            'white-space:nowrap;';
+        if (FOLLOWER) {
+            popOutBtn.textContent = '⇲ Dock';
+            popOutBtn.title = 'Return this panel to the main window';
+        } else {
+            popOutBtn.textContent = '⇱ Pop';
+            popOutBtn.title = 'Open this panel in a new window';
+        }
+        bar.appendChild(popOutBtn);
+
         panelDiv.appendChild(bar);
 
         const barToggleBtn = document.createElement('button');
@@ -510,6 +580,7 @@
             paletteSelect,
             camSmoothingWrap, camSmoothingSlider, camSmoothingLabel,
             masteryHeading, masterySlider, masteryLabel,
+            popOutBtn,
         };
     }
 
@@ -930,6 +1001,14 @@
             _writePanelCameraSmoothing(idx, v);
         };
 
+        // Pop Out / Dock button handler. In the main window: pop out this panel
+        // into a new browser window. In the popup (FOLLOWER): post a `docked`
+        // message so the main reinstates the panel, then close the popup.
+        panel.popOutBtn.onclick = () => {
+            if (FOLLOWER) dockFollowerPanel(panel);
+            else popOutPanel(panel);
+        };
+
         // Populate arrangement dropdown (includes Lyrics, JT, and 3D options)
         populateSelect(panel, arrIndex);
 
@@ -1185,6 +1264,145 @@
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  Pop-out / dock helpers
+    // ══════════════════════════════════════════════════════════════════════
+
+    function _captureMode(panel) {
+        if (panel.lyricsMode) return 'lyrics';
+        if (panel.jumpingTabMode) return 'jt';
+        if (panel.hw3dMode) return '3d';
+        return '2d';
+    }
+
+    function _captureFollowerConfig(panel, panelIdx) {
+        const cfg = {
+            arrangement: panel.arrIndex || 0,
+            mode:        _captureMode(panel),
+            inverted:    panel.hw.getInverted() ? 1 : 0,
+            mastery:     panel.hw.getMastery(),
+        };
+        // 3D-only settings — read the per-panel localStorage values that the
+        // splitscreen UI writes via _writePanelPalette / _writePanelCameraSmoothing.
+        try {
+            const p = localStorage.getItem('h3d_bg_panel' + panelIdx + '_palette')
+                   || localStorage.getItem('h3d_bg_palette');
+            if (p) cfg.palette = p;
+        } catch (_) {}
+        try {
+            const cs = localStorage.getItem('h3d_bg_panel' + panelIdx + '_cameraSmoothing')
+                    || localStorage.getItem('h3d_bg_cameraSmoothing');
+            if (cs != null) cfg.cameraSmoothing = parseFloat(cs);
+        } catch (_) {}
+        return cfg;
+    }
+
+    function _newPopupId() {
+        try {
+            return crypto.randomUUID();
+        } catch (_) {
+            return 'p-' + Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
+        }
+    }
+
+    // Open a popup window pre-configured to show this panel as a follower.
+    // The panel is removed from the main layout once the popup is opened
+    // (slot collapses; rebuildLayout reflows remaining panels).
+    function popOutPanel(panel) {
+        if (!currentFilename) return;
+        const idx = panels.indexOf(panel);
+        if (idx === -1) return;
+        if (typeof BroadcastChannel !== 'function') {
+            alert('Pop-out requires a browser that supports BroadcastChannel.');
+            return;
+        }
+        const cfg = _captureFollowerConfig(panel, idx);
+        const popupId = _newPopupId();
+
+        const url = new URL(window.location.origin + '/');
+        const sp = url.searchParams;
+        sp.set('ssFollower', '1');
+        sp.set('popupId', popupId);
+        sp.set('filename', currentFilename);
+        sp.set('arrangement', String(cfg.arrangement));
+        sp.set('mode', cfg.mode);
+        sp.set('inverted', String(cfg.inverted));
+        if (Number.isFinite(cfg.mastery)) sp.set('mastery', String(cfg.mastery));
+        if (cfg.palette) sp.set('palette', cfg.palette);
+        if (Number.isFinite(cfg.cameraSmoothing)) sp.set('cameraSmoothing', String(cfg.cameraSmoothing));
+
+        const popup = window.open(url.toString(), popupId, 'popup,width=1280,height=420');
+        if (!popup) {
+            alert('Pop-out blocked by browser. Allow popups for this origin and try again.');
+            return;
+        }
+        popups.set(popupId, { panelIdx: idx, originalConfig: cfg });
+
+        // Open the channel in the main window so we can broadcast time and
+        // listen for the popup's docked / closed messages.
+        _ensureMainBroadcasterAndListener();
+        _startPopupBroadcaster();
+
+        // Remove this panel from the live layout. The remaining panels are
+        // rebuilt; if popping leaves only 1 panel we stop split entirely and
+        // the main view goes back to its default highway. If 2 remain in a
+        // quad layout we downgrade to top-bottom so we don't leave an empty
+        // default slot in the grid.
+        const wasActive = active;
+        const remaining = panels.filter(p => p !== panel);
+        const savedPrefs = remaining.map(p => ({
+            arrName: p.jumpingTabMode
+                ? JUMPING_TAB_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
+                : p.hw3dMode
+                ? HW3D_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
+                : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
+            lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
+            inverted: p.hw.getInverted(),
+            detectChannel: p.detectChannel || 'mono',
+            barHidden: p.bar.style.display === 'none',
+            mastery: p.hw.getMastery(),
+        }));
+
+        if (wasActive && savedPrefs.length === 0) {
+            // Single-panel split (rare) — pop out leaves nothing.
+            stopSplitScreen();
+            return;
+        }
+        if (wasActive && savedPrefs.length === 1) {
+            // Last panel popped — go back to the default highway view.
+            teardownPanels();
+            stopSplitScreen();
+            return;
+        }
+        // 2+ remaining. Downgrade quad → top-bottom if we'd otherwise leave
+        // an empty default slot. Keep top-bottom / left-right as-is.
+        if (wasActive && LAYOUTS[layout] && savedPrefs.length < LAYOUTS[layout].panels) {
+            layout = 'top-bottom';
+            try { localStorage.setItem('splitscreenLayout', layout); } catch (_) {}
+        }
+        if (wasActive) {
+            teardownPanels();
+            startSplitScreen(null, savedPrefs);
+        }
+    }
+
+    // Called from the popup when the user clicks Dock or closes the window.
+    // Posts the panel's current state back to the main window then closes.
+    function dockFollowerPanel(panel) {
+        if (!FOLLOWER) return;
+        try {
+            const ch = _ssChannel();
+            if (ch) {
+                ch.postMessage({
+                    type: 'docked',
+                    popupId: FOLLOWER.popupId,
+                    finalState: _captureFollowerConfig(panel, 0),
+                });
+            }
+        } catch (_) {}
+        try { window.close(); } catch (_) {}
+    }
+
     // ── Main toggle ──
     function rebuildLayout() {
         const wasActive = active;
@@ -1354,6 +1572,106 @@
         if (syncInterval) {
             clearInterval(syncInterval);
             syncInterval = null;
+        }
+    }
+
+    // ── Popup time broadcaster ──
+    // Broadcasts audio.currentTime over BroadcastChannel whenever there is
+    // at least one popped-out panel listening. Runs INDEPENDENTLY of the
+    // splitscreen sync loop above — the user can pop the only panel out,
+    // main goes back to the default highway view, and the popup still
+    // receives time updates. Started when the first popup is registered;
+    // stopped when the last popup is dropped.
+    let _popupBroadcastInterval = null;
+    function _startPopupBroadcaster() {
+        if (_popupBroadcastInterval) return;
+        const audio = document.getElementById('audio');
+        const ch = _ssChannel();
+        if (!audio || !ch) return;
+        _popupBroadcastInterval = setInterval(() => {
+            if (popups.size === 0) { _stopPopupBroadcaster(); return; }
+            ch.postMessage({ type: 'time', t: audio.currentTime });
+        }, 1000 / 60);
+    }
+    function _stopPopupBroadcaster() {
+        if (_popupBroadcastInterval) {
+            clearInterval(_popupBroadcastInterval);
+            _popupBroadcastInterval = null;
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  Main-window broadcaster / listener for popped-out panels
+    // ══════════════════════════════════════════════════════════════════════
+    let _mainChannelListenerAttached = false;
+    function _ensureMainBroadcasterAndListener() {
+        if (FOLLOWER) return;            // never run in popup
+        const ch = _ssChannel();
+        if (!ch || _mainChannelListenerAttached) return;
+        _mainChannelListenerAttached = true;
+        ch.onmessage = (ev) => {
+            const msg = ev.data || {};
+            if (msg.type === 'docked' && msg.popupId && popups.has(msg.popupId)) {
+                _redockPanel(msg.popupId, msg.finalState || null);
+            } else if (msg.type === 'closed' && msg.popupId && popups.has(msg.popupId)) {
+                // Popup was closed without an explicit Dock click. Treat
+                // the panel as removed; don't re-add. Just drop the entry.
+                popups.delete(msg.popupId);
+            }
+        };
+    }
+
+    // Re-instate a panel that was popped out, using the original config
+    // we captured at pop-out time, overlaid with anything the popup told
+    // us via `finalState`.
+    function _redockPanel(popupId, finalState) {
+        const entry = popups.get(popupId);
+        if (!entry) return;
+        popups.delete(popupId);
+        if (!currentFilename) return;
+
+        // Decide where to slot the redocked panel back. If split is currently
+        // active, capture the running prefs and append; otherwise start split
+        // fresh with just this one panel.
+        const merged = Object.assign({}, entry.originalConfig, finalState || {});
+        const arrName = (merged.mode === 'lyrics') ? LYRICS_VALUE
+            : (merged.mode === 'jt') ? (JUMPING_TAB_VALUE + ':' + (arrangements[merged.arrangement]?.name || ''))
+            : (merged.mode === '3d') ? (HW3D_VALUE + ':' + (arrangements[merged.arrangement]?.name || ''))
+            : (arrangements[merged.arrangement]?.name || '');
+        const newPrefs = {
+            arrName,
+            lyrics: true,
+            inverted: !!merged.inverted,
+            detectChannel: 'mono',
+            barHidden: false,
+            mastery: Number.isFinite(merged.mastery) ? merged.mastery : 1,
+        };
+
+        // Persist any per-panel 3D settings so the renderer picks them up
+        // when it spins back up. We don't know the slot yet, so we write to
+        // the slot the panel will land in (computed below).
+        let targetIdx;
+        let savedPrefs;
+        if (active) {
+            savedPrefs = captureCurrentPrefs();
+            targetIdx = savedPrefs.length;
+            savedPrefs.push(newPrefs);
+        } else {
+            targetIdx = 0;
+            savedPrefs = [newPrefs];
+        }
+        if (merged.palette) {
+            try { localStorage.setItem('h3d_bg_panel' + targetIdx + '_palette', merged.palette); } catch (_) {}
+        }
+        if (Number.isFinite(merged.cameraSmoothing)) {
+            try { localStorage.setItem('h3d_bg_panel' + targetIdx + '_cameraSmoothing', String(merged.cameraSmoothing)); } catch (_) {}
+        }
+
+        if (active) {
+            teardownPanels();
+            startSplitScreen(null, savedPrefs);
+        } else {
+            startSplitScreen(null, savedPrefs);
         }
     }
 
@@ -1560,7 +1878,9 @@
     const _play = window.playSong;
     window.playSong = async function (f, a) {
         const wasActive = active;
-        if (active) stopSplitScreen();
+        // In a follower window, never auto-stop split — the follower panel IS
+        // the only thing on screen, and we drive its setup ourselves.
+        if (!FOLLOWER && active) stopSplitScreen();
         await _play(f, a);
 
         currentFilename = f;
@@ -1578,14 +1898,22 @@
             if (origOnReady) origOnReady();
             highway._onReady = null;
 
-            if (!handled && (alwaysSplit || (wasActive && autoReactivate))) {
+            // Auto-follow: notify any popped-out panels that the song just
+            // changed so they can swap to the new chart in their current
+            // mode + arrangement. Only the main window broadcasts; FOLLOWER
+            // windows skip this.
+            if (!FOLLOWER && popups.size > 0 && ssChannel) {
+                ssChannel.postMessage({ type: 'song-changed', filename: currentFilename });
+            }
+
+            if (!handled && !FOLLOWER && (alwaysSplit || (wasActive && autoReactivate))) {
                 handled = true;
                 startSplitScreen();
             }
         };
 
         // Fallback: poll for song info in case _onReady was missed
-        if (alwaysSplit || (wasActive && autoReactivate)) {
+        if (!FOLLOWER && (alwaysSplit || (wasActive && autoReactivate))) {
             let attempts = 0;
             const poll = setInterval(() => {
                 attempts++;
@@ -1602,13 +1930,273 @@
             }, 200);
         }
 
-        injectBtn();
+        if (!FOLLOWER) injectBtn();
     };
 
-    // Clean up on screen change
+    // Clean up on screen change. In follower mode the popup never navigates
+    // away from the player, but if something tries we don't tear down split
+    // (the follower panel IS the player).
     const _show = window.showScreen;
     window.showScreen = function (id) {
-        if (id !== 'player' && active) stopSplitScreen();
+        if (!FOLLOWER && id !== 'player' && active) stopSplitScreen();
         _show(id);
     };
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  Follower-mode bootstrap (popup window only)
+    //  The actual `if (FOLLOWER) bootFollowerMode();` invocation is at the
+    //  bottom of this IIFE — all the `let` bindings the function references
+    //  (especially _followerAudio) must be past their TDZ before we call it.
+    // ══════════════════════════════════════════════════════════════════════
+
+    // In follower mode, the popup's local <audio> element is paused (we never
+    // surface a play button, and we can't programmatically auto-play across
+    // browsers reliably). Lyrics pane, jumping tab pane, and the highway's
+    // own time-driven helpers all read `audio.currentTime` directly though.
+    // We shim the property here so reads in the popup return the time
+    // broadcast from the main window — letting all those subsystems work
+    // without needing per-mode rewires.
+    let _followerCurrentTime = 0;
+    function _installFollowerAudioShim(audio) {
+        if (!audio) return;
+        try {
+            Object.defineProperty(audio, 'currentTime', {
+                get() { return _followerCurrentTime; },
+                set(_v) { /* ignore — popup audio is a follower */ },
+                configurable: true,
+            });
+        } catch (e) {
+            console.warn('[splitscreen-follower] failed to install audio.currentTime shim:', e);
+        }
+    }
+
+    // Cached reference to the popup's <audio> element so the song-change
+    // handler can re-assert mute / re-shim without re-querying.
+    let _followerAudio = null;
+
+    function bootFollowerMode() {
+        // Hide non-panel chrome with a single CSS rule so we don't have to
+        // chase every element id slopsmith renders. The follower wrap covers
+        // the viewport at a high z-index; #player (and our wrap) stay visible.
+        const style = document.createElement('style');
+        style.textContent =
+            'body.ss-follower #nav,' +
+            'body.ss-follower header,' +
+            'body.ss-follower .screen:not(#player),' +
+            'body.ss-follower #player-controls,' +
+            'body.ss-follower #player-hud,' +
+            'body.ss-follower #section-map,' +
+            'body.ss-follower #btn-splitscreen,' +
+            'body.ss-follower #splitscreen-layout-btn,' +
+            'body.ss-follower #btn-splitscreen-hide-bar,' +
+            'body.ss-follower #btn-splitscreen-float-controls' +
+            '{display:none !important;}' +
+            'body.ss-follower #player{padding:0 !important;}' +
+            'body.ss-follower{margin:0;overflow:hidden;}';
+        document.head.appendChild(style);
+        document.body.classList.add('ss-follower');
+
+        // Mute the popup's local audio. The follower never plays; it slaves
+        // to the main window's currentTime via BroadcastChannel.
+        _followerAudio = document.getElementById('audio');
+        if (_followerAudio) {
+            _followerAudio.muted = true;
+            _followerAudio.volume = 0;
+        }
+        // Shim audio.currentTime so anything that reads it (lyrics pane,
+        // jumping tab pane, ...) sees the broadcast time, not the popup's
+        // own paused-at-0 audio clock.
+        _installFollowerAudioShim(_followerAudio);
+
+        // Notify main when the popup is closed so the slot isn't held open
+        // indefinitely. Registered once; survives song-change rebuilds.
+        window.addEventListener('beforeunload', () => {
+            try {
+                const c = _ssChannel();
+                if (c) c.postMessage({ type: 'closed', popupId: FOLLOWER.popupId });
+            } catch (_) {}
+        });
+
+        // Resize handler: panels[0] is always the live follower panel after
+        // any song-change rebuild, so this single listener stays correct.
+        window.addEventListener('resize', () => {
+            if (panels[0]) panels[0].hw.resize();
+        });
+
+        // Wait one frame so all plugin IIFEs that loaded before us have
+        // finished installing their playSong wraps and globals.
+        requestAnimationFrame(() => {
+            if (typeof window.showScreen === 'function') window.showScreen('player');
+            loadSongInFollower(FOLLOWER.filename, FOLLOWER);
+        });
+    }
+
+    // Load `filename` in the popup, wait for it to be ready, then build the
+    // follower panel from `cfg`. Used both on initial bootstrap (cfg = the
+    // FOLLOWER config from URL params) and on song-change (cfg = freshly
+    // captured from the current panel state).
+    async function loadSongInFollower(filename, cfg) {
+        // Pre-seed per-panel 3D settings (slot 0 in popup) BEFORE the
+        // renderer first reads them.
+        if (cfg.palette) {
+            try { localStorage.setItem('h3d_bg_panel0_palette', cfg.palette); } catch (_) {}
+        }
+        if (Number.isFinite(cfg.cameraSmoothing)) {
+            try { localStorage.setItem('h3d_bg_panel0_cameraSmoothing', String(cfg.cameraSmoothing)); } catch (_) {}
+        }
+        try {
+            await window.playSong(filename, cfg.arrangement);
+        } catch (e) {
+            console.error('[splitscreen-follower] playSong failed:', e);
+            return;
+        }
+        // Re-assert mute (playSong resets audio.src; some browsers unmute
+        // on src change). Also re-install the currentTime shim — the
+        // <audio> element is the same instance so the property override
+        // should still be in place, but cheap to re-confirm.
+        if (_followerAudio) { _followerAudio.muted = true; _followerAudio.volume = 0; }
+        await waitForHighwayReady();
+        buildFollowerPanel(cfg);
+    }
+
+    function waitForHighwayReady() {
+        return new Promise(resolve => {
+            const info = highway.getSongInfo();
+            if (info && info.arrangements && info.arrangements.length) {
+                resolve();
+                return;
+            }
+            const orig = highway._onReady;
+            let resolved = false;
+            highway._onReady = () => {
+                if (orig) orig();
+                highway._onReady = null;
+                if (!resolved) { resolved = true; resolve(); }
+            };
+            let attempts = 0;
+            const poll = setInterval(() => {
+                attempts++;
+                if (resolved || attempts > 60) { clearInterval(poll); if (!resolved) resolve(); return; }
+                const i = highway.getSongInfo();
+                if (i && i.arrangements && i.arrangements.length) {
+                    clearInterval(poll);
+                    if (!resolved) { resolved = true; resolve(); }
+                }
+            }, 100);
+        });
+    }
+
+    function buildFollowerPanel(cfg) {
+        const info = highway.getSongInfo();
+        if (info && info.arrangements) arrangements = info.arrangements;
+        // Clamp the arrangement index against the new song's arrangement
+        // count — protects against an out-of-range arrIndex when main
+        // switches to a song with fewer arrangements.
+        const arrIdx = (cfg.arrangement >= 0 && cfg.arrangement < arrangements.length)
+            ? cfg.arrangement
+            : 0;
+
+        // Build a full-viewport wrap. Reuse #splitscreen-wrap id so any
+        // CSS selectors / lookups elsewhere find it the same way.
+        const followerWrap = document.createElement('div');
+        followerWrap.id = 'splitscreen-wrap';
+        followerWrap.style.cssText = 'position:fixed;inset:0;background:#000;z-index:9999;';
+        document.body.appendChild(followerWrap);
+        wrap = followerWrap;
+
+        const parts = createPanel(0, followerWrap, 'follower');
+        const hw = createHighway();
+        const panel = Object.assign({ hw, arrIndex: 0 }, parts);
+
+        // Same hw.resize override pattern startSplitScreen() uses, so the
+        // follower window resizing recomputes the canvas dims correctly.
+        hw.resize = function () {
+            const c = panel.canvas;
+            if (!c) return;
+            const rect = panel.panelDiv.getBoundingClientRect();
+            const barH = panel.bar.style.display === 'none' ? 0 : (panel.bar.offsetHeight || 28);
+            const w = rect.width;
+            const h = Math.max(0, rect.height - barH);
+            c.style.width = w + 'px';
+            c.style.height = h + 'px';
+            const scale = hw.getRenderScale();
+            c.width = Math.round(w * scale);
+            c.height = Math.round(h * scale);
+        };
+
+        panels.push(panel);
+
+        const arrName = (cfg.mode === 'lyrics') ? LYRICS_VALUE
+            : (cfg.mode === 'jt') ? (JUMPING_TAB_VALUE + ':' + (arrangements[arrIdx]?.name || ''))
+            : (cfg.mode === '3d') ? (HW3D_VALUE + ':' + (arrangements[arrIdx]?.name || ''))
+            : (arrangements[arrIdx]?.name || '');
+        const prefs = {
+            arrName,
+            lyrics: true,
+            inverted: !!cfg.inverted,
+            detectChannel: 'mono',
+            barHidden: false,
+            mastery: Number.isFinite(cfg.mastery) ? cfg.mastery : 1,
+        };
+
+        initPanel(panel, arrIdx, prefs);
+        active = true;
+        panel.hw.resize();
+
+        // Subscribe to messages from the main window. The listener handles
+        // both per-frame time updates and song-change events. We replace
+        // the channel handler each rebuild so the closure captures the
+        // current `panel`; previous panel references are dropped along
+        // with the old DOM in teardownPanels().
+        const ch = _ssChannel();
+        if (ch) {
+            ch.onmessage = (ev) => {
+                const msg = ev.data || {};
+                if (msg.type === 'time' && Number.isFinite(msg.t)) {
+                    _followerCurrentTime = msg.t;
+                    if (!panel.lyricsMode && !panel.jumpingTabMode) panel.hw.setTime(msg.t);
+                } else if (msg.type === 'song-changed' && msg.filename && msg.filename !== currentFilename) {
+                    _handleFollowerSongChange(msg.filename);
+                }
+            };
+        }
+    }
+
+    // Capture the panel's current state for a song-change rebuild. Reads
+    // from the live panel (so any user changes since pop-out are honoured)
+    // and from per-panel localStorage (palette + smoothing, in case the
+    // user dialled them in the popup).
+    function _captureCurrentFollowerConfig() {
+        const p = panels[0];
+        const out = {
+            arrangement:     p ? (p.arrIndex || 0) : 0,
+            mode:            p ? _captureMode(p) : (FOLLOWER ? FOLLOWER.mode : '2d'),
+            inverted:        p ? (p.hw.getInverted() ? 1 : 0) : 0,
+            mastery:         p ? p.hw.getMastery() : 1,
+        };
+        try {
+            const v = localStorage.getItem('h3d_bg_panel0_palette');
+            if (v) out.palette = v;
+        } catch (_) {}
+        try {
+            const v = localStorage.getItem('h3d_bg_panel0_cameraSmoothing');
+            if (v != null) out.cameraSmoothing = parseFloat(v);
+        } catch (_) {}
+        return out;
+    }
+
+    // Rebuild the follower panel for a new song while preserving the
+    // user's mode + arrangement choice. Triggered by the main window's
+    // `song-changed` broadcast.
+    async function _handleFollowerSongChange(newFilename) {
+        const cfg = _captureCurrentFollowerConfig();
+        teardownPanels();
+        active = false;
+        await loadSongInFollower(newFilename, cfg);
+    }
+
+    // Kick off follower-mode bootstrap — placed at the very end of the IIFE
+    // so all `let` bindings the function touches (e.g. _followerAudio) are
+    // past their temporal dead zone by the time the function executes.
+    if (FOLLOWER) bootFollowerMode();
 })();
