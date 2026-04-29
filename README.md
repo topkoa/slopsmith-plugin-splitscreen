@@ -10,6 +10,7 @@ A plugin for [Slopsmith](https://github.com/byrongamatos/slopsmith) that shows 2
 - **Per-panel invert toggle** — flip individual panels between player and audience perspective independently
 - **Per-panel note detection** — each panel can independently detect notes from a specific audio input channel; pairs with the [Note Detect](https://github.com/byrongamatos/slopsmith-plugin-notedetect) plugin for multi-guitar setups
 - **Pop a panel into its own window** — click **⇱ Pop** on any panel to open it in a new browser window; drag it to a second monitor and resize it freely. The popup is muted and slaved to the main window's audio time, so there's still only one sound source. A **⇲ Dock** button (or just closing the window) returns the panel to its original splitscreen slot.
+- **Split a popped window internally** — every popup gets its own bottom toolbar with a layout picker (Single / Top-Bottom / Left-Right / Quad). A popped window can mirror the same layouts as the main splitter, so you can run e.g. a quad on a second monitor with all four arrangements while the main window stays single-panel.
 - **Hide/show bottom controls bar** — click **▾ Bar** (next to Close) to collapse the global player controls and reclaim the vertical space; a floating **▴ Controls** pill restores them
 - **Hide/show per-panel mini bar** — each panel has a **▾ Bar** button pinned to its bottom-right corner to collapse that panel's controls independently; click **▴ Bar** to restore
 - **Smart defaults** — opens with lead → rhythm → bass auto-assigned across panels when those arrangements exist, wrapping to fill the rest
@@ -53,6 +54,10 @@ While popped:
 - If you load a different song in the main window, popped panels **auto-follow** in their current mode + arrangement (clamped to arrangement 0 if the new song has fewer arrangements).
 
 To bring it back: click **⇲ Dock** in the popup, or simply close the popup window. The panel returns to its original splitscreen slot in the main window. Per-panel state changes you made in the popup (mastery, palette, camera smoothing, …) are preserved on dock-back.
+
+#### Splitting a popped window further
+
+Every popup has a small toolbar pinned to its bottom edge with a **Layout** picker. The same layouts available in main are available here: **Single**, **Top/Bottom**, **Left/Right**, **Quad**. Switching layouts inside a popup keeps the slots you already configured and fills any new ones (lead → rhythm → bass) using the same smart-defaults the main toggle uses. Each popup has its own layout independent of main and any other popups, so you can run e.g. a quad of all four arrangements on a second monitor while keeping main on a single 3D highway.
 
 > Pop-out uses standard `window.open` and `BroadcastChannel`. The popup must be triggered by your click (a user gesture) so popup blockers should leave it alone — but if your browser does block it, allow popups for the slopsmith origin and try again. Closing the main window while popups are open will freeze them (no time source); they'll need to be closed manually.
 
