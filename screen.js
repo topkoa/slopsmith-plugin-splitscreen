@@ -439,6 +439,31 @@
         }
         bar.appendChild(paletteSelect);
 
+        // Per-panel camera-smoothing slider (3D-only). Mirrors the plugin's
+        // global slider in settings.html but writes the per-panel localStorage
+        // key so this panel can have its own feel without touching the global.
+        const camSmoothingWrap = document.createElement('span');
+        camSmoothingWrap.title = '3D camera smoothing (this panel only)';
+        camSmoothingWrap.style.cssText =
+            'display:none;align-items:center;gap:4px;white-space:nowrap;';
+        const camSmoothingHeading = document.createElement('span');
+        camSmoothingHeading.style.cssText = 'font-size:10px;color:#6b7280;';
+        camSmoothingHeading.textContent = 'Cam';
+        const camSmoothingSlider = document.createElement('input');
+        camSmoothingSlider.type = 'range';
+        camSmoothingSlider.min = '0';
+        camSmoothingSlider.max = '1';
+        camSmoothingSlider.step = '0.05';
+        camSmoothingSlider.value = '0.5';
+        camSmoothingSlider.style.cssText = 'width:70px;';
+        const camSmoothingLabel = document.createElement('span');
+        camSmoothingLabel.style.cssText = 'font-size:10px;color:#9ca3af;width:24px;text-align:right;';
+        camSmoothingLabel.textContent = '0.50';
+        camSmoothingWrap.appendChild(camSmoothingHeading);
+        camSmoothingWrap.appendChild(camSmoothingSlider);
+        camSmoothingWrap.appendChild(camSmoothingLabel);
+        bar.appendChild(camSmoothingWrap);
+
         const masteryHeading = document.createElement('span');
         masteryHeading.style.cssText = 'font-size:10px;color:#6b7280;white-space:nowrap;';
         masteryHeading.textContent = 'Mastery';
@@ -483,6 +508,7 @@
             detectBtn, updateDetectStyle,
             channelBtn, viewBtn,
             paletteSelect,
+            camSmoothingWrap, camSmoothingSlider, camSmoothingLabel,
             masteryHeading, masterySlider, masteryLabel,
         };
     }
@@ -557,6 +583,31 @@
             return 'default';
         }
     }
+    function _readPanelCameraSmoothing(panelIdx) {
+        try {
+            const stored = localStorage.getItem('h3d_bg_panel' + panelIdx + '_cameraSmoothing')
+                ?? localStorage.getItem('h3d_bg_cameraSmoothing');
+            const n = stored == null ? 0.5 : parseFloat(stored);
+            return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0.5;
+        } catch (_) {
+            return 0.5;
+        }
+    }
+    function _writePanelCameraSmoothing(panelIdx, value) {
+        const v = String(value);
+        try { localStorage.setItem('h3d_bg_panel' + panelIdx + '_cameraSmoothing', v); } catch (_) {}
+        // Re-fire the global setter with its existing value so the 3D
+        // plugin's _bgEmitChange runs and each renderer re-reads its
+        // settings — picking up the per-panel override we just wrote.
+        // No global state changes hands.
+        if (typeof window.h3dBgSetCameraSmoothing === 'function') {
+            const cur = (() => {
+                try { return localStorage.getItem('h3d_bg_cameraSmoothing') || '0.5'; }
+                catch (_) { return '0.5'; }
+            })();
+            window.h3dBgSetCameraSmoothing(cur);
+        }
+    }
     function _writePanelPalette(panelIdx, value) {
         try { localStorage.setItem('h3d_bg_panel' + panelIdx + '_palette', value); } catch (_) {}
         if (typeof window.h3dBgSetPalette === 'function') {
@@ -576,6 +627,19 @@
     }
     function hidePaletteSelect(panel) {
         panel.paletteSelect.style.display = 'none';
+    }
+
+    function showCamSmoothing(panel) {
+        const idx = panels.indexOf(panel);
+        if (idx === -1) return;
+        if (typeof window.slopsmithViz_highway_3d !== 'function') return;
+        const v = _readPanelCameraSmoothing(idx);
+        panel.camSmoothingSlider.value = String(v);
+        panel.camSmoothingLabel.textContent = v.toFixed(2);
+        panel.camSmoothingWrap.style.display = '';
+    }
+    function hideCamSmoothing(panel) {
+        panel.camSmoothingWrap.style.display = 'none';
     }
 
     // ── Mastery slider helpers ──
@@ -647,6 +711,7 @@
         panel.masterySlider.style.display = 'none';
         panel.masteryLabel.style.display = 'none';
         hidePaletteSelect(panel);
+        hideCamSmoothing(panel);
 
         panel.lyricsPane = createLyricsPane(panel.panelDiv);
         panel.lyricsPane.el.style.bottom = (panel.bar.offsetHeight || 28) + 'px';
@@ -697,6 +762,7 @@
         panel.masterySlider.style.display = 'none';
         panel.masteryLabel.style.display = 'none';
         hidePaletteSelect(panel);
+        hideCamSmoothing(panel);
 
         const jtContainer = document.createElement('div');
         jtContainer.style.cssText =
@@ -765,6 +831,7 @@
         panel.hw.connect(getWsUrl(currentFilename, panel.arrIndex), { onSongInfo: () => {} });
         panel.hw3dMode = true;
         showPaletteSelect(panel);
+        showCamSmoothing(panel);
 
         panel.updateInvertStyle(panel.hw.getInverted());
         panel.invertBtn.onclick = () => {
@@ -787,6 +854,7 @@
         panel.hw.setRenderer(null);
         panel.hw3dMode = false;
         hidePaletteSelect(panel);
+        hideCamSmoothing(panel);
 
         panel.tabBtn.style.display = '';
 
@@ -852,6 +920,14 @@
             const idx = panels.indexOf(panel);
             if (idx === -1) return;
             _writePanelPalette(idx, panel.paletteSelect.value);
+        };
+
+        panel.camSmoothingSlider.oninput = () => {
+            const idx = panels.indexOf(panel);
+            if (idx === -1) return;
+            const v = parseFloat(panel.camSmoothingSlider.value);
+            panel.camSmoothingLabel.textContent = (Number.isFinite(v) ? v : 0.5).toFixed(2);
+            _writePanelCameraSmoothing(idx, v);
         };
 
         // Populate arrangement dropdown (includes Lyrics, JT, and 3D options)
