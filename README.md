@@ -9,6 +9,7 @@ A plugin for [Slopsmith](https://github.com/byrongamatos/slopsmith) that shows 2
 - **Per-panel visualization picker** — each panel can independently run any installed `slopsmithViz` plugin (e.g. the 3D highway) alongside the default 2D highway
 - **Per-panel invert toggle** — flip individual panels between player and audience perspective independently
 - **Per-panel note detection** — each panel can independently detect notes from a specific audio input channel; pairs with the [Note Detect](https://github.com/byrongamatos/slopsmith-plugin-notedetect) plugin for multi-guitar setups
+- **Pop a panel into its own window** — click **⇱ Pop** on any panel to open it in a new browser window; drag it to a second monitor and resize it freely. The popup is muted and slaved to the main window's audio time, so there's still only one sound source. A **⇲ Dock** button (or just closing the window) returns the panel to its original splitscreen slot.
 - **Hide/show bottom controls bar** — click **▾ Bar** (next to Close) to collapse the global player controls and reclaim the vertical space; a floating **▴ Controls** pill restores them
 - **Hide/show per-panel mini bar** — each panel has a **▾ Bar** button pinned to its bottom-right corner to collapse that panel's controls independently; click **▴ Bar** to restore
 - **Smart defaults** — opens with lead → rhythm → bass auto-assigned across panels when those arrangements exist, wrapping to fill the rest
@@ -39,6 +40,21 @@ Split screen works with both PSARC and `.sloppak` songs — any song with more t
 - **Per-panel mini bar** — each panel has a **▾ Bar** button pinned to its bottom-right corner. Click it to collapse that panel's mini controls (arrangement picker, Invert, Lyrics, Tab, etc.); the highway fills the full panel height. Click **▴ Bar** to restore.
 
 Both states are saved to `localStorage` and restored automatically the next time you activate splitscreen.
+
+### Popping a panel onto a second monitor
+
+Each panel's mini bar has a **⇱ Pop** button. Clicking it opens that panel in its own browser window, which you can then drag to a second monitor and resize independently — handy for multi-monitor practice setups where you want the highway, lyrics, or jumping tab on a separate screen from the main player.
+
+While popped:
+
+- The panel disappears from the main splitscreen layout (the slot collapses; if only one panel was left in main, the main window goes back to its default highway).
+- The popup is **muted**. Audio still plays from the main window — there's only one sound source, never doubled or out of sync.
+- Time is broadcast from the main window via `BroadcastChannel`, so the popup's highway / lyrics / jumping tab follows the main song precisely.
+- If you load a different song in the main window, popped panels **auto-follow** in their current mode + arrangement (clamped to arrangement 0 if the new song has fewer arrangements).
+
+To bring it back: click **⇲ Dock** in the popup, or simply close the popup window. The panel returns to its original splitscreen slot in the main window. Per-panel state changes you made in the popup (mastery, palette, camera smoothing, …) are preserved on dock-back.
+
+> Pop-out uses standard `window.open` and `BroadcastChannel`. The popup must be triggered by your click (a user gesture) so popup blockers should leave it alone — but if your browser does block it, allow popups for the slopsmith origin and try again. Closing the main window while popups are open will freeze them (no time source); they'll need to be closed manually.
 
 ## Settings
 
