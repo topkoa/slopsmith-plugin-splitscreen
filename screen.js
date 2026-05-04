@@ -19,7 +19,7 @@
     const STORAGE_KEY = 'splitscreenPanelPrefs';
     const LYRICS_VALUE       = '__lyrics__';
     const JUMPING_TAB_VALUE  = '__jumping_tab__';
-    const HW3D_VALUE         = '__3d_highway__';
+    const VIZ_PREFIX         = '__viz__';
     const DETECT_CHANNEL_CYCLE  = ['mono', 'left', 'right'];
     const DETECT_CHANNEL_LABELS = { mono: 'M', left: 'L', right: 'R' };
 
@@ -32,6 +32,19 @@
     let wrap = null;
     let currentFilename = null;
     let arrangements = []; // arrangement list from song_info
+    let vizPlugins   = []; // {id, name, ...} — type=visualization plugins with loaded factories
+
+    async function fetchVizPlugins() {
+        try {
+            const resp = await fetch('/api/plugins');
+            const all  = await resp.json();
+            vizPlugins = (all || []).filter(p =>
+                p?.type === 'visualization' &&
+                typeof window['slopsmithViz_' + p.id] === 'function'
+            );
+        } catch (_) { vizPlugins = []; }
+    }
+    fetchVizPlugins();
 
     // ══════════════════════════════════════════════════════════════════════
     //  Pop-out / follower-mode (multi-monitor support).
@@ -138,8 +151,8 @@
         const prefs = panels.map(p => ({
             arrName: p.jumpingTabMode
                 ? JUMPING_TAB_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
-                : p.hw3dMode
-                ? HW3D_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
+                : p.vizMode
+                ? VIZ_PREFIX + ':' + p.vizMode + ':' + (arrangements[p.arrIndex]?.name || '')
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
             inverted: p.hw.getInverted(),
@@ -158,8 +171,18 @@
         }
     }
 
+    function migratePanelPrefs(prefs) {
+        if (!Array.isArray(prefs)) return prefs;
+        return prefs.map(p => {
+            if (p?.arrName?.startsWith('__3d_highway__:')) {
+                return { ...p, arrName: VIZ_PREFIX + ':highway_3d:' + p.arrName.slice('__3d_highway__:'.length) };
+            }
+            return p;
+        });
+    }
+
     function resolveArrIndex(arrName) {
-        if (!arrName || arrName === LYRICS_VALUE || arrName.startsWith(JUMPING_TAB_VALUE) || arrName.startsWith(HW3D_VALUE)) return -1;
+        if (!arrName || arrName === LYRICS_VALUE || arrName.startsWith(JUMPING_TAB_VALUE) || arrName.startsWith(VIZ_PREFIX)) return -1;
         const lower = arrName.toLowerCase();
         for (let i = 0; i < arrangements.length; i++) {
             if ((arrangements[i].name || '').toLowerCase() === lower) return i;
@@ -756,15 +779,15 @@
             });
         }
 
-        if (typeof window.slopsmithViz_highway_3d === 'function') {
+        vizPlugins.forEach(vp => {
             arrangements.forEach((a, i) => {
                 const opt = document.createElement('option');
-                opt.value = HW3D_VALUE + ':' + i;
-                opt.textContent = (a.name || `Arr ${i}`) + ' (3D)';
-                if (panel.hw3dMode && panel.arrIndex === i) opt.selected = true;
+                opt.value = VIZ_PREFIX + ':' + vp.id + ':' + i;
+                opt.textContent = (a.name || `Arr ${i}`) + ' (' + (vp.name || vp.id) + ')';
+                if (panel.vizMode === vp.id && panel.arrIndex === i) opt.selected = true;
                 panel.select.appendChild(opt);
             });
-        }
+        });
     }
 
     function enterLyricsMode(panel) {
@@ -885,8 +908,8 @@
         savePanelPrefs();
     }
 
-    function enter3DHwMode(panel) {
-        if (panel.hw3dMode) return;
+    function enterVizMode(panel, pluginId) {
+        if (panel.vizMode) return;
 
         if (panel.lyricsMode) exitLyricsMode(panel, panel.arrIndex);
         if (panel.jumpingTabMode) exitJumpingTabMode(panel, panel.arrIndex);
@@ -895,14 +918,10 @@
         panel.tabBtn.style.display = 'none';
         panel.viewBtn.style.display = 'none';
 
-        // Hand the panel's existing highway a 3D renderer, then connect so
-        // the highway's WebSocket and RAF loop start feeding draw(bundle) calls.
-        panel.hw.setRenderer(window.slopsmithViz_highway_3d());
+        panel.hw.setRenderer(window['slopsmithViz_' + pluginId]());
         hookPanelReady(panel);
         panel.hw.connect(getWsUrl(currentFilename, panel.arrIndex), { onSongInfo: () => {} });
-        panel.hw3dMode = true;
-        showPaletteSelect(panel);
-        showCamSmoothing(panel);
+        panel.vizMode = pluginId;
 
         panel.updateInvertStyle(panel.hw.getInverted());
         panel.invertBtn.onclick = () => {
@@ -912,20 +931,17 @@
             savePanelPrefs();
         };
 
-        panel.select.value = HW3D_VALUE + ':' + panel.arrIndex;
-        panel.arrName.textContent = (arrangements[panel.arrIndex]?.name || '') + ' (3D)';
+        const vp = vizPlugins.find(p => p.id === pluginId);
+        panel.select.value = VIZ_PREFIX + ':' + pluginId + ':' + panel.arrIndex;
+        panel.arrName.textContent = (arrangements[panel.arrIndex]?.name || '') + ' (' + (vp?.name || pluginId) + ')';
         savePanelPrefs();
     }
 
-    function exit3DHwMode(panel, arrIndex) {
-        if (!panel.hw3dMode) return;
+    function exitVizMode(panel, arrIndex) {
+        if (!panel.vizMode) return;
 
-        // Revert to the default highway renderer — calls destroy() on the 3D
-        // renderer which restores the 2D canvas display automatically.
         panel.hw.setRenderer(null);
-        panel.hw3dMode = false;
-        hidePaletteSelect(panel);
-        hideCamSmoothing(panel);
+        panel.vizMode = null;
 
         panel.tabBtn.style.display = '';
 
@@ -948,15 +964,18 @@
     function initPanel(panel, arrIndex, prefs) {
         const isLyricsMode = prefs?.arrName === LYRICS_VALUE;
         const isJumpingTabMode = prefs?.arrName?.startsWith(JUMPING_TAB_VALUE) || false;
-        const is3DMode = prefs?.arrName?.startsWith(HW3D_VALUE) || false;
+        const isVizMode = prefs?.arrName?.startsWith(VIZ_PREFIX + ':') || false;
+        let savedVizPluginId = null;
         if (isJumpingTabMode) {
             const jtArrName = prefs.arrName.slice(JUMPING_TAB_VALUE.length + 1);
             const jtIdx = resolveArrIndex(jtArrName);
             panel.arrIndex = jtIdx >= 0 ? jtIdx : arrIndex;
-        } else if (is3DMode) {
-            const d3ArrName = prefs.arrName.slice(HW3D_VALUE.length + 1);
-            const d3Idx = resolveArrIndex(d3ArrName);
-            panel.arrIndex = d3Idx >= 0 ? d3Idx : arrIndex;
+        } else if (isVizMode) {
+            const parts = prefs.arrName.split(':');
+            savedVizPluginId = parts[1];
+            const vizArrName = parts.slice(2).join(':');
+            const vizIdx = resolveArrIndex(vizArrName);
+            panel.arrIndex = vizIdx >= 0 ? vizIdx : arrIndex;
         } else {
             panel.arrIndex = isLyricsMode ? 0 : arrIndex;
         }
@@ -965,12 +984,12 @@
         panel.jumpingTabMode = false;
         panel.jumpingTabPane = null;
         panel.jumpingTabContainer = null;
-        panel.hw3dMode = false;
+        panel.vizMode = null;
 
         panel.hw.init(panel.canvas);
 
         // Apply saved preferences
-        if (prefs && !isLyricsMode && !isJumpingTabMode && !is3DMode) {
+        if (prefs && !isLyricsMode && !isJumpingTabMode && !isVizMode) {
             if (prefs.inverted !== undefined) panel.hw.setInverted(prefs.inverted);
             if (prefs.lyrics !== undefined && typeof panel.hw.setLyricsVisible === 'function') {
                 panel.hw.setLyricsVisible(prefs.lyrics);
@@ -1014,7 +1033,7 @@
 
         panel.arrName.textContent = isLyricsMode ? 'Lyrics'
             : isJumpingTabMode ? 'Jumping Tab'
-            : is3DMode ? (arrangements[panel.arrIndex]?.name || '') + ' (3D)'
+            : isVizMode ? (arrangements[panel.arrIndex]?.name || '') + ' (viz)'
             : (arrangements[arrIndex]?.name || '');
 
         panel.select.onchange = () => {
@@ -1030,17 +1049,21 @@
                     panel.jumpingTabMode = false;
                 }
                 enterJumpingTabMode(panel);
-            } else if (val.startsWith(HW3D_VALUE + ':')) {
-                const d3Idx = parseInt(val.split(':')[1]);
-                panel.arrIndex = d3Idx;
-                if (panel.hw3dMode) {
-                    // Already in 3D — recreate hw to avoid the old WS leaking
+            } else if (val.startsWith(VIZ_PREFIX + ':')) {
+                const parts    = val.split(':');
+                const pluginId = parts[1];
+                const vizIdx   = parseInt(parts[2]);
+                panel.arrIndex = vizIdx;
+                if (panel.vizMode) {
+                    // Already in viz mode — recreate hw to avoid the old WS leaking
                     // notes from the previous arrangement into the new one.
                     recreatePanelHighway(panel);
-                    panel.hw.setRenderer(window.slopsmithViz_highway_3d());
+                    panel.hw.setRenderer(window['slopsmithViz_' + pluginId]());
                     hookPanelReady(panel);
-                    panel.hw.connect(getWsUrl(currentFilename, d3Idx), { onSongInfo: () => {} });
-                    panel.arrName.textContent = (arrangements[d3Idx]?.name || '') + ' (3D)';
+                    panel.hw.connect(getWsUrl(currentFilename, vizIdx), { onSongInfo: () => {} });
+                    panel.vizMode = pluginId;
+                    const vp = vizPlugins.find(p => p.id === pluginId);
+                    panel.arrName.textContent = (arrangements[vizIdx]?.name || '') + ' (' + (vp?.name || pluginId) + ')';
                     // Re-bind invert handler on the fresh hw
                     panel.updateInvertStyle(panel.hw.getInverted());
                     panel.invertBtn.onclick = () => {
@@ -1051,7 +1074,7 @@
                     };
                     savePanelPrefs();
                 } else {
-                    enter3DHwMode(panel);
+                    enterVizMode(panel, pluginId);
                 }
             } else if (val === LYRICS_VALUE) {
                 enterLyricsMode(panel);
@@ -1059,8 +1082,8 @@
                 const newIdx = parseInt(val);
                 if (panel.jumpingTabMode) {
                     exitJumpingTabMode(panel, newIdx);
-                } else if (panel.hw3dMode) {
-                    exit3DHwMode(panel, newIdx);
+                } else if (panel.vizMode) {
+                    exitVizMode(panel, newIdx);
                 } else if (panel.lyricsMode) {
                     exitLyricsMode(panel, newIdx);
                 } else {
@@ -1125,8 +1148,9 @@
             enterLyricsMode(panel);
         } else if (isJumpingTabMode) {
             enterJumpingTabMode(panel);
-        } else if (is3DMode) {
-            enter3DHwMode(panel);
+        } else if (isVizMode && savedVizPluginId &&
+                   typeof window['slopsmithViz_' + savedVizPluginId] === 'function') {
+            enterVizMode(panel, savedVizPluginId);
         } else {
             // Connect WebSocket. Pass an empty onSongInfo so core skips its
             // default writes to shared HUD / audio / arrangement dropdown
@@ -1247,9 +1271,9 @@
                 p.jumpingTabPane.destroy();
                 p.jumpingTabPane = null;
             }
-            if (p.hw3dMode) {
+            if (p.vizMode) {
                 p.hw.setRenderer(null);
-                p.hw3dMode = false;
+                p.vizMode = null;
             }
             if (p.tabInstance) {
                 try { p.tabInstance.destroy(); } catch (_) {}
@@ -1271,30 +1295,17 @@
     function _captureMode(panel) {
         if (panel.lyricsMode) return 'lyrics';
         if (panel.jumpingTabMode) return 'jt';
-        if (panel.hw3dMode) return '3d';
+        if (panel.vizMode) return 'viz:' + panel.vizMode;
         return '2d';
     }
 
-    function _captureFollowerConfig(panel, panelIdx) {
-        const cfg = {
+    function _captureFollowerConfig(panel) {
+        return {
             arrangement: panel.arrIndex || 0,
             mode:        _captureMode(panel),
             inverted:    panel.hw.getInverted() ? 1 : 0,
             mastery:     panel.hw.getMastery(),
         };
-        // 3D-only settings — read the per-panel localStorage values that the
-        // splitscreen UI writes via _writePanelPalette / _writePanelCameraSmoothing.
-        try {
-            const p = localStorage.getItem('h3d_bg_panel' + panelIdx + '_palette')
-                   || localStorage.getItem('h3d_bg_palette');
-            if (p) cfg.palette = p;
-        } catch (_) {}
-        try {
-            const cs = localStorage.getItem('h3d_bg_panel' + panelIdx + '_cameraSmoothing')
-                    || localStorage.getItem('h3d_bg_cameraSmoothing');
-            if (cs != null) cfg.cameraSmoothing = parseFloat(cs);
-        } catch (_) {}
-        return cfg;
     }
 
     function _newPopupId() {
@@ -1316,7 +1327,7 @@
             alert('Pop-out requires a browser that supports BroadcastChannel.');
             return;
         }
-        const cfg = _captureFollowerConfig(panel, idx);
+        const cfg = _captureFollowerConfig(panel);
         const popupId = _newPopupId();
 
         const url = new URL(window.location.origin + '/');
@@ -1328,8 +1339,6 @@
         sp.set('mode', cfg.mode);
         sp.set('inverted', String(cfg.inverted));
         if (Number.isFinite(cfg.mastery)) sp.set('mastery', String(cfg.mastery));
-        if (cfg.palette) sp.set('palette', cfg.palette);
-        if (Number.isFinite(cfg.cameraSmoothing)) sp.set('cameraSmoothing', String(cfg.cameraSmoothing));
 
         const popup = window.open(url.toString(), popupId, 'popup,width=1280,height=420');
         if (!popup) {
@@ -1353,8 +1362,8 @@
         const savedPrefs = remaining.map(p => ({
             arrName: p.jumpingTabMode
                 ? JUMPING_TAB_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
-                : p.hw3dMode
-                ? HW3D_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
+                : p.vizMode
+                ? VIZ_PREFIX + ':' + p.vizMode + ':' + (arrangements[p.arrIndex]?.name || '')
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
             inverted: p.hw.getInverted(),
@@ -1396,7 +1405,7 @@
                 ch.postMessage({
                     type: 'docked',
                     popupId: FOLLOWER.popupId,
-                    finalState: _captureFollowerConfig(panel, 0),
+                    finalState: _captureFollowerConfig(panel),
                 });
             }
         } catch (_) {}
@@ -1415,8 +1424,8 @@
         return panels.map(p => ({
             arrName: p.jumpingTabMode
                 ? JUMPING_TAB_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
-                : p.hw3dMode
-                ? HW3D_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
+                : p.vizMode
+                ? VIZ_PREFIX + ':' + p.vizMode + ':' + (arrangements[p.arrIndex]?.name || '')
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
             lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
             inverted: p.hw.getInverted(),
@@ -1435,7 +1444,7 @@
 
         // If no explicit arrangements or prefs passed, try loading from storage
         if (!existingArrangements && !savedPrefs) {
-            savedPrefs = loadPanelPrefs();
+            savedPrefs = migratePanelPrefs(loadPanelPrefs());
         }
 
         const cfg = LAYOUTS[layout];
@@ -1456,10 +1465,11 @@
                     const jtArrName = pref.arrName.slice(JUMPING_TAB_VALUE.length + 1);
                     const jtIdx = resolveArrIndex(jtArrName);
                     arrDefaults.push(jtIdx >= 0 ? jtIdx : 0);
-                } else if (pref && pref.arrName?.startsWith(HW3D_VALUE)) {
-                    const d3ArrName = pref.arrName.slice(HW3D_VALUE.length + 1);
-                    const d3Idx = resolveArrIndex(d3ArrName);
-                    arrDefaults.push(d3Idx >= 0 ? d3Idx : 0);
+                } else if (pref && pref.arrName?.startsWith(VIZ_PREFIX + ':')) {
+                    const parts = pref.arrName.split(':');
+                    const vizArrName = parts.slice(2).join(':');
+                    const vizIdx = resolveArrIndex(vizArrName);
+                    arrDefaults.push(vizIdx >= 0 ? vizIdx : 0);
                 } else {
                     const idx = pref ? resolveArrIndex(pref.arrName) : -1;
                     arrDefaults.push(idx >= 0 ? idx : getDefaultArrangements(1)[0]);
@@ -1636,7 +1646,7 @@
         const merged = Object.assign({}, entry.originalConfig, finalState || {});
         const arrName = (merged.mode === 'lyrics') ? LYRICS_VALUE
             : (merged.mode === 'jt') ? (JUMPING_TAB_VALUE + ':' + (arrangements[merged.arrangement]?.name || ''))
-            : (merged.mode === '3d') ? (HW3D_VALUE + ':' + (arrangements[merged.arrangement]?.name || ''))
+            : merged.mode?.startsWith('viz:') ? (VIZ_PREFIX + ':' + merged.mode.slice(4) + ':' + (arrangements[merged.arrangement]?.name || ''))
             : (arrangements[merged.arrangement]?.name || '');
         const newPrefs = {
             arrName,
@@ -2133,7 +2143,7 @@
     function _followerCfgToPrefs(cfg, arrIdx) {
         const arrName = (cfg.mode === 'lyrics') ? LYRICS_VALUE
             : (cfg.mode === 'jt') ? (JUMPING_TAB_VALUE + ':' + (arrangements[arrIdx]?.name || ''))
-            : (cfg.mode === '3d') ? (HW3D_VALUE + ':' + (arrangements[arrIdx]?.name || ''))
+            : cfg.mode?.startsWith('viz:') ? (VIZ_PREFIX + ':' + cfg.mode.slice(4) + ':' + (arrangements[arrIdx]?.name || ''))
             : (arrangements[arrIdx]?.name || '');
         return {
             arrName,
@@ -2319,23 +2329,7 @@
 
         // Capture current panel configs (in slot order) so the rebuilt
         // grid keeps existing arrangement / mode / inverted / mastery.
-        const cfgs = panels.map((p, idx) => {
-            const out = {
-                arrangement: p.arrIndex || 0,
-                mode:        _captureMode(p),
-                inverted:    p.hw.getInverted() ? 1 : 0,
-                mastery:     p.hw.getMastery(),
-            };
-            try {
-                const v = localStorage.getItem('h3d_bg_panel' + idx + '_palette');
-                if (v) out.palette = v;
-            } catch (_) {}
-            try {
-                const v = localStorage.getItem('h3d_bg_panel' + idx + '_cameraSmoothing');
-                if (v != null) out.cameraSmoothing = parseFloat(v);
-            } catch (_) {}
-            return out;
-        });
+        const cfgs = panels.map(p => _captureFollowerConfig(p));
 
         teardownPanels();
         active = false;
@@ -2348,23 +2342,7 @@
     // last layout change are honoured) and from per-panel localStorage
     // (palette + smoothing, in case the user dialled them in the popup).
     function _captureAllFollowerConfigs() {
-        return panels.map((p, idx) => {
-            const out = {
-                arrangement: p.arrIndex || 0,
-                mode:        _captureMode(p),
-                inverted:    p.hw.getInverted() ? 1 : 0,
-                mastery:     p.hw.getMastery(),
-            };
-            try {
-                const v = localStorage.getItem('h3d_bg_panel' + idx + '_palette');
-                if (v) out.palette = v;
-            } catch (_) {}
-            try {
-                const v = localStorage.getItem('h3d_bg_panel' + idx + '_cameraSmoothing');
-                if (v != null) out.cameraSmoothing = parseFloat(v);
-            } catch (_) {}
-            return out;
-        });
+        return panels.map(p => _captureFollowerConfig(p));
     }
 
     // Rebuild the follower panels for a new song while preserving the
@@ -2514,7 +2492,7 @@
                 const arrName = arrangements[p.arrIndex]?.name || 'Arr ' + p.arrIndex;
                 const modeSuffix = p.lyricsMode ? ' (Lyrics)'
                     : p.jumpingTabMode ? ' (JT)'
-                    : p.hw3dMode ? ' (3D)'
+                    : p.vizMode ? ' (' + (vizPlugins.find(vp => vp.id === p.vizMode)?.name || p.vizMode) + ')'
                     : '';
                 return 'P' + (idx + 1) + ': ' + arrName + modeSuffix;
             });
