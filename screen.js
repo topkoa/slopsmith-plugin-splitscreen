@@ -43,7 +43,16 @@
             // populateSelect() time (not at fetch time), so the window['slopsmithViz_*']
             // globals are evaluated when the dropdown is first built.
             vizPlugins = (all || []).filter(p => p?.type === 'visualization');
-        } catch (_) { vizPlugins = []; }
+        } catch (_) {
+            // /api/plugins unavailable — fall back to scanning window for any
+            // slopsmithViz_* factories that are already loaded so viz options
+            // remain available even when the plugin registry can't be fetched
+            // (preserves prior behaviour where 3D Highway was discoverable
+            // by direct factory check alone).
+            vizPlugins = Object.keys(window)
+                .filter(k => k.startsWith('slopsmithViz_') && typeof window[k] === 'function')
+                .map(k => ({ id: k.slice('slopsmithViz_'.length), name: k.slice('slopsmithViz_'.length) }));
+        }
     }
     // Keep the promise so startSplitScreen / loadSongInFollower can await it —
     // panels are never populated before the list is ready even on a fast first
@@ -74,14 +83,12 @@
             const params = new URLSearchParams(window.location.search);
             if (params.get('ssFollower') !== '1') return null;
             const cfg = {
-                popupId:         params.get('popupId') || '',
-                filename:        params.get('filename') || '',
-                arrangement:     parseInt(params.get('arrangement'), 10) || 0,
-                mode:            params.get('mode') || '2d',
-                inverted:        params.get('inverted') === '1',
-                mastery:         parseFloat(params.get('mastery')),
-                palette:         params.get('palette') || '',
-                cameraSmoothing: parseFloat(params.get('cameraSmoothing')),
+                popupId:     params.get('popupId') || '',
+                filename:    params.get('filename') || '',
+                arrangement: parseInt(params.get('arrangement'), 10) || 0,
+                mode:        params.get('mode') || '2d',
+                inverted:    params.get('inverted') === '1',
+                mastery:     parseFloat(params.get('mastery')),
             };
             if (!cfg.filename) return null;
             return cfg;
@@ -953,8 +960,10 @@
     function exitVizMode(panel, arrIndex) {
         if (!panel.vizMode) return;
 
-        // Recreate the highway so the viz renderer's context is discarded and
-        // the fresh 2D highway gets a clean canvas — symmetric with enterVizMode.
+        // Clear the renderer first so it can release its resources (WebGL
+        // context, event listeners) via its own cleanup path, then recreate
+        // the highway to give the fresh 2D renderer a clean canvas.
+        panel.hw.setRenderer(null);
         recreatePanelHighway(panel);
         panel.vizMode = null;
 
@@ -1053,7 +1062,7 @@
             else popOutPanel(panel);
         };
 
-        // Populate arrangement dropdown (includes Lyrics, JT, and 3D options)
+        // Populate arrangement dropdown (includes Lyrics, JT, and viz plugin options)
         populateSelect(panel, arrIndex);
 
         panel.arrName.textContent = isLyricsMode ? 'Lyrics'
@@ -1080,6 +1089,9 @@
                 const vizIdx   = parseInt(parts[2]);
                 panel.arrIndex = vizIdx;
                 if (panel.vizMode) {
+                    // Clear the current renderer before recreating so it can
+                    // release its resources (WebGL context, event listeners).
+                    panel.hw.setRenderer(null);
                     // Already in viz mode — recreate hw to avoid the old WS leaking
                     // notes from the previous arrangement into the new one.
                     recreatePanelHighway(panel);
@@ -1695,24 +1707,12 @@
             mastery: Number.isFinite(merged.mastery) ? merged.mastery : 1,
         };
 
-        // Persist any per-panel 3D settings so the renderer picks them up
-        // when it spins back up. We don't know the slot yet, so we write to
-        // the slot the panel will land in (computed below).
-        let targetIdx;
         let savedPrefs;
         if (active) {
             savedPrefs = captureCurrentPrefs();
-            targetIdx = savedPrefs.length;
             savedPrefs.push(newPrefs);
         } else {
-            targetIdx = 0;
             savedPrefs = [newPrefs];
-        }
-        if (merged.palette) {
-            try { localStorage.setItem('h3d_bg_panel' + targetIdx + '_palette', merged.palette); } catch (_) {}
-        }
-        if (Number.isFinite(merged.cameraSmoothing)) {
-            try { localStorage.setItem('h3d_bg_panel' + targetIdx + '_cameraSmoothing', String(merged.cameraSmoothing)); } catch (_) {}
         }
 
         if (active) {
@@ -2100,18 +2100,6 @@
     // info purposes; per-panel arrangement is set inside each panel's own
     // WebSocket via initPanel.
     async function loadSongInFollower(filename, cfgs) {
-        // Pre-seed per-panel 3D settings (palette, cameraSmoothing) for
-        // every slot BEFORE the renderer first reads them.
-        for (let i = 0; i < cfgs.length; i++) {
-            const cfg = cfgs[i];
-            if (!cfg) continue;
-            if (cfg.palette) {
-                try { localStorage.setItem('h3d_bg_panel' + i + '_palette', cfg.palette); } catch (_) {}
-            }
-            if (Number.isFinite(cfg.cameraSmoothing)) {
-                try { localStorage.setItem('h3d_bg_panel' + i + '_cameraSmoothing', String(cfg.cameraSmoothing)); } catch (_) {}
-            }
-        }
         const firstArr = (cfgs[0] && cfgs[0].arrangement) || 0;
         try {
             await window.playSong(filename, firstArr);
