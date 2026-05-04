@@ -50,7 +50,7 @@ screen.js
 | `wrap` | element\|null | The `#splitscreen-wrap` div, or null when inactive |
 | `currentFilename` | string\|null | The filename passed to the last `playSong` call |
 | `arrangements` | array | Arrangement list from the last `song_info` WebSocket message |
-| `vizPlugins` | array | `{id, name, …}` entries from `/api/plugins` where `type==='visualization'` and the `slopsmithViz_<id>` factory is loaded. Populated once on page load via `fetchVizPlugins()`. |
+| `vizPlugins` | array | `{id, name, …}` entries from `/api/plugins` where `type==='visualization'`. Populated once on page load via `fetchVizPlugins()`. Factory availability (`slopsmithViz_<id>`) is checked lazily in `populateSelect()`, not at fetch time. |
 | `syncInterval` | id\|null | The `setInterval` handle for the time sync loop |
 | `layoutBtn` | element\|null | The layout `<select>` injected into `#player-controls` |
 | `hideBtn` | element\|null | The `▾ Bar` button injected into `#player-controls` |
@@ -173,7 +173,7 @@ Each panel is always in exactly one of these modes. Flags are mutually exclusive
 - `canvas` stays visible (renderer draws to it)
 - Tab / view buttons hidden; no per-panel settings bar shown (configure via global plugin settings)
 - To exit: `panel.hw.setRenderer(null)` reverts to default 2D renderer
-- **Canvas context-type lock:** the first `getContext('2d')` or `getContext('webgl')` call on a canvas locks it for its lifetime. Swapping renderers mid-session on the same canvas (e.g. 2D → WebGL → 2D) may not work without re-creating the canvas. The restore-on-load path is safe because `setRenderer` runs before `hw.init()`. For mid-session swaps between 2D and WebGL renderers, `recreatePanelHighway(panel)` is called first (same pattern as the arrangement-switch inside an already-active viz mode).
+- **Canvas context-type lock:** the first `getContext('2d')` or `getContext('webgl')` call on a canvas locks it for its lifetime. Swapping renderers mid-session on the same canvas (e.g. 2D → WebGL → 2D) may not work without re-creating the canvas. The restore-on-load path is safe because `initPanel()` calls `panel.hw.setRenderer(factory())` **before** `hw.init(canvas)` when a viz pref is detected — so the canvas is initialised with the correct context type from the start. For mid-session swaps between 2D and WebGL renderers, `recreatePanelHighway(panel)` is called first (same pattern as the arrangement-switch inside an already-active viz mode).
 
 ### Tab overlay (`tabActive=true`)
 - Can coexist with normal highway mode (not with lyrics/JT/3D modes)

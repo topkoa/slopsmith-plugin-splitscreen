@@ -33,18 +33,21 @@
     let currentFilename = null;
     let arrangements = []; // arrangement list from song_info
     let vizPlugins   = []; // {id, name, ...} — type=visualization plugins from /api/plugins
+    let _starting    = false; // re-entrancy guard for startSplitScreen
 
     async function fetchVizPlugins() {
         try {
             const resp = await fetch('/api/plugins');
             const all  = await resp.json();
-            // Store metadata for all viz plugins; factory presence is checked lazily
-            // in populateSelect() so deferred/async plugin scripts are always reflected.
+            // Store metadata for all viz plugins; factory presence is checked at
+            // populateSelect() time (not at fetch time), so the window['slopsmithViz_*']
+            // globals are evaluated when the dropdown is first built.
             vizPlugins = (all || []).filter(p => p?.type === 'visualization');
         } catch (_) { vizPlugins = []; }
     }
-    // Keep the promise so startSplitScreen can await it — panels are never
-    // populated before the list is ready even on a fast first interaction.
+    // Keep the promise so startSplitScreen / loadSongInFollower can await it —
+    // panels are never populated before the list is ready even on a fast first
+    // interaction.
     const _vizPluginsReady = fetchVizPlugins();
 
     // ══════════════════════════════════════════════════════════════════════
@@ -909,7 +912,7 @@
         savePanelPrefs();
     }
 
-    function enterVizMode(panel, pluginId) {
+    function enterVizMode(panel, pluginId, rendererPreInstalled) {
         if (panel.vizMode) return;
 
         if (panel.lyricsMode) exitLyricsMode(panel, panel.arrIndex);
@@ -919,7 +922,12 @@
         panel.tabBtn.style.display = 'none';
         panel.viewBtn.style.display = 'none';
 
-        panel.hw.setRenderer(window['slopsmithViz_' + pluginId]());
+        // Skip setRenderer when the caller already installed the renderer
+        // before hw.init (restore-on-load path) to avoid creating a redundant
+        // renderer instance and to respect the canvas context-type lock order.
+        if (!rendererPreInstalled) {
+            panel.hw.setRenderer(window['slopsmithViz_' + pluginId]());
+        }
         hookPanelReady(panel);
         panel.hw.connect(getWsUrl(currentFilename, panel.arrIndex), { onSongInfo: () => {} });
         panel.vizMode = pluginId;
@@ -987,6 +995,16 @@
         panel.jumpingTabContainer = null;
         panel.vizMode = null;
 
+        // For viz restore: install the renderer BEFORE hw.init so the canvas
+        // context is locked to the correct type (2D vs WebGL) on first init.
+        // See CLAUDE.md "Canvas context-type lock" caveat.
+        const vizFactoryFn = isVizMode && savedVizPluginId
+            ? window['slopsmithViz_' + savedVizPluginId]
+            : null;
+        if (typeof vizFactoryFn === 'function') {
+            panel.hw.setRenderer(vizFactoryFn());
+        }
+
         panel.hw.init(panel.canvas);
 
         // Apply saved preferences
@@ -1034,7 +1052,7 @@
 
         panel.arrName.textContent = isLyricsMode ? 'Lyrics'
             : isJumpingTabMode ? 'Jumping Tab'
-            : isVizMode ? (arrangements[panel.arrIndex]?.name || '') + ' (viz)'
+            : (isVizMode && typeof vizFactoryFn === 'function') ? (arrangements[panel.arrIndex]?.name || '') + ' (viz)'
             : (arrangements[arrIndex]?.name || '');
 
         panel.select.onchange = () => {
@@ -1151,7 +1169,9 @@
             enterJumpingTabMode(panel);
         } else if (isVizMode && savedVizPluginId &&
                    typeof window['slopsmithViz_' + savedVizPluginId] === 'function') {
-            enterVizMode(panel, savedVizPluginId);
+            // Renderer was already installed before hw.init above; pass true to
+            // skip the redundant setRenderer call inside enterVizMode.
+            enterVizMode(panel, savedVizPluginId, /* rendererPreInstalled */ true);
         } else {
             // Connect WebSocket. Pass an empty onSongInfo so core skips its
             // default writes to shared HUD / audio / arrangement dropdown
@@ -1437,6 +1457,11 @@
     }
 
     async function startSplitScreen(existingArrangements, savedPrefs) {
+        // Re-entrancy guard: prevent concurrent starts from double-clicks,
+        // layout rebuilds, or auto-reactivate firing while a start is in flight.
+        if (_starting || active) return;
+        _starting = true;
+        try {
         await _vizPluginsReady;
 
         const info = highway.getSongInfo();
@@ -1534,6 +1559,9 @@
 
         // Hook into the time sync loop
         startTimeSync();
+        } finally {
+            _starting = false;
+        }
     }
 
     function stopSplitScreen() {
@@ -1559,6 +1587,7 @@
     }
 
     function toggle() {
+        if (_starting) return; // treat in-flight start as already active
         if (active) {
             stopSplitScreen();
         } else {
@@ -2090,6 +2119,9 @@
         // should still be in place, but cheap to re-confirm.
         if (_followerAudio) { _followerAudio.muted = true; _followerAudio.volume = 0; }
         await waitForHighwayReady();
+        // Ensure viz plugin metadata is ready before buildFollowerLayout calls
+        // populateSelect() — same guarantee startSplitScreen gives main panels.
+        await _vizPluginsReady;
         // Honour the user's chosen layout (default 'follower' = single).
         // Pad cfgs with null so any extra slots get smart defaults inside
         // buildFollowerLayout.
@@ -2341,9 +2373,8 @@
 
     // Capture every popup panel's current state into an array of cfgs,
     // suitable for handing back to loadSongInFollower / buildFollowerLayout.
-    // Reads from the live panels (so any user changes since pop-out /
-    // last layout change are honoured) and from per-panel localStorage
-    // (palette + smoothing, in case the user dialled them in the popup).
+    // Reads from the live panels so any user changes since pop-out or
+    // last layout change are honoured.
     function _captureAllFollowerConfigs() {
         return panels.map(p => _captureFollowerConfig(p));
     }
