@@ -43,7 +43,9 @@
             vizPlugins = (all || []).filter(p => p?.type === 'visualization');
         } catch (_) { vizPlugins = []; }
     }
-    fetchVizPlugins();
+    // Keep the promise so startSplitScreen can await it — panels are never
+    // populated before the list is ready even on a fast first interaction.
+    const _vizPluginsReady = fetchVizPlugins();
 
     // ══════════════════════════════════════════════════════════════════════
     //  Pop-out / follower-mode (multi-monitor support).
@@ -1434,7 +1436,9 @@
         }));
     }
 
-    function startSplitScreen(existingArrangements, savedPrefs) {
+    async function startSplitScreen(existingArrangements, savedPrefs) {
+        await _vizPluginsReady;
+
         const info = highway.getSongInfo();
         if (info && info.arrangements) {
             arrangements = info.arrangements;
