@@ -102,7 +102,7 @@ Each entry in `panels[]` is built with `Object.assign({ hw, arrIndex: 0 }, parts
   detectBtn,         // Detect toggle button
   updateDetectStyle, // fn(bool)
   channelBtn,        // M/L/R channel button
-  viewBtn,           // view button (hidden while any viz mode is active)
+  viewBtn,           // view button (always hidden — vestigial DOM placeholder, not used)
 
   // From startSplitScreen() / initPanel():
   hw,                // highway instance (createHighway())
@@ -172,8 +172,8 @@ Each panel is always in exactly one of these modes. Flags are mutually exclusive
 - `panel.hw.setRenderer(window['slopsmithViz_' + pluginId]())` installs the renderer
 - `canvas` stays visible (renderer draws to it)
 - Tab / view buttons hidden; no per-panel settings bar shown (configure via global plugin settings)
-- To exit: `panel.hw.setRenderer(null)` reverts to default 2D renderer
-- **Canvas context-type lock:** the first `getContext('2d')` or `getContext('webgl')` call on a canvas locks it for its lifetime. Swapping renderers mid-session on the same canvas (e.g. 2D → WebGL → 2D) may not work without re-creating the canvas. The restore-on-load path is safe because `initPanel()` calls `panel.hw.setRenderer(factory())` **before** `hw.init(canvas)` when a viz pref is detected — so the canvas is initialised with the correct context type from the start. For mid-session swaps between 2D and WebGL renderers, `recreatePanelHighway(panel)` is called first (same pattern as the arrangement-switch inside an already-active viz mode).
+- To exit: `recreatePanelHighway(panel)` discards the viz highway and installs a fresh 2D highway
+- **Canvas context-type lock:** the first `getContext('2d')` or `getContext('webgl')` call on a canvas locks it for its lifetime. Swapping renderers mid-session on the same canvas (e.g. 2D → WebGL → 2D) may not work without re-creating the canvas. The restore-on-load path is safe because `initPanel()` calls `panel.hw.setRenderer(factory())` **before** `hw.init(canvas)` when a viz pref is detected — so the canvas is initialised with the correct context type from the start. For mid-session 2D ↔ viz swaps (and viz-to-viz arrangement switches), `recreatePanelHighway(panel)` is called first to discard the previous highway instance before the new renderer takes over.
 
 ### Tab overlay (`tabActive=true`)
 - Can coexist with normal highway mode (not with lyrics/JT/3D modes)

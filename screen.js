@@ -186,7 +186,7 @@
     }
 
     function resolveArrIndex(arrName) {
-        if (!arrName || arrName === LYRICS_VALUE || arrName.startsWith(JUMPING_TAB_VALUE) || arrName.startsWith(VIZ_PREFIX)) return -1;
+        if (!arrName || arrName === LYRICS_VALUE || arrName.startsWith(JUMPING_TAB_VALUE) || arrName.startsWith(VIZ_PREFIX + ':')) return -1;
         const lower = arrName.toLowerCase();
         for (let i = 0; i < arrangements.length; i++) {
             if ((arrangements[i].name || '').toLowerCase() === lower) return i;
@@ -926,6 +926,10 @@
         // before hw.init (restore-on-load path) to avoid creating a redundant
         // renderer instance and to respect the canvas context-type lock order.
         if (!rendererPreInstalled) {
+            // Recreate the highway on the same canvas so the previous 2D context
+            // is discarded before the viz renderer (potentially WebGL) takes over.
+            // Same mitigation used for viz-to-viz arrangement switches.
+            recreatePanelHighway(panel);
             panel.hw.setRenderer(window['slopsmithViz_' + pluginId]());
         }
         hookPanelReady(panel);
@@ -949,7 +953,9 @@
     function exitVizMode(panel, arrIndex) {
         if (!panel.vizMode) return;
 
-        panel.hw.setRenderer(null);
+        // Recreate the highway so the viz renderer's context is discarded and
+        // the fresh 2D highway gets a clean canvas — symmetric with enterVizMode.
+        recreatePanelHighway(panel);
         panel.vizMode = null;
 
         panel.tabBtn.style.display = '';
