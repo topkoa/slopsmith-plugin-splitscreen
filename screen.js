@@ -32,16 +32,15 @@
     let wrap = null;
     let currentFilename = null;
     let arrangements = []; // arrangement list from song_info
-    let vizPlugins   = []; // {id, name, ...} — type=visualization plugins with loaded factories
+    let vizPlugins   = []; // {id, name, ...} — type=visualization plugins from /api/plugins
 
     async function fetchVizPlugins() {
         try {
             const resp = await fetch('/api/plugins');
             const all  = await resp.json();
-            vizPlugins = (all || []).filter(p =>
-                p?.type === 'visualization' &&
-                typeof window['slopsmithViz_' + p.id] === 'function'
-            );
+            // Store metadata for all viz plugins; factory presence is checked lazily
+            // in populateSelect() so deferred/async plugin scripts are always reflected.
+            vizPlugins = (all || []).filter(p => p?.type === 'visualization');
         } catch (_) { vizPlugins = []; }
     }
     fetchVizPlugins();
@@ -779,7 +778,7 @@
             });
         }
 
-        vizPlugins.forEach(vp => {
+        vizPlugins.filter(vp => typeof window['slopsmithViz_' + vp.id] === 'function').forEach(vp => {
             arrangements.forEach((a, i) => {
                 const opt = document.createElement('option');
                 opt.value = VIZ_PREFIX + ':' + vp.id + ':' + i;
