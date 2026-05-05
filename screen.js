@@ -26,7 +26,6 @@
     let active = false;
     let controlsHidden = false;
     let layout = localStorage.getItem('splitscreenLayout') || 'top-bottom';
-    let autoReactivate = localStorage.getItem('splitscreenAutoReactivate') === 'true';
     let alwaysSplit = localStorage.getItem('splitscreenAlwaysSplit') === 'true';
     let panels = [];       // { hw, canvas, ws, arrIndex, controls }
     let wrap = null;
@@ -222,15 +221,6 @@
             layout = layoutSelect.value;
             localStorage.setItem('splitscreenLayout', layout);
             if (active) rebuildLayout();
-        });
-    }
-
-    const autoReactivateCheckbox = document.getElementById('splitscreen-auto-reactivate');
-    if (autoReactivateCheckbox) {
-        autoReactivateCheckbox.checked = autoReactivate;
-        autoReactivateCheckbox.addEventListener('change', () => {
-            autoReactivate = autoReactivateCheckbox.checked;
-            localStorage.setItem('splitscreenAutoReactivate', autoReactivate);
         });
     }
 
@@ -1809,6 +1799,7 @@
         // the renderer mounts to #player (main-player fast path) on the first
         // entry and is stuck full-screen until the next start cycle.
         active = true;
+        try { localStorage.setItem('splitscreenActive', 'true'); } catch (_) {}
         focusedPanelIdx = 0;
 
         // Size the wrap NOW so panelDivs have a real rect during initPanel.
@@ -1942,6 +1933,9 @@
     function toggle() {
         if (_starting) return; // treat in-flight start as already active
         if (active) {
+            // User-intent off — persist so navigation-driven stops (song
+            // switch, leaving player) don't erase the user's on-state.
+            try { localStorage.setItem('splitscreenActive', 'false'); } catch (_) {}
             stopSplitScreen();
         } else {
             startSplitScreen();
@@ -2267,7 +2261,10 @@
     // ── Hook into playSong ──
     const _play = window.playSong;
     window.playSong = async function (f, a) {
-        const wasActive = active;
+        // OR in persisted active flag so split state carries across page
+        // loads — without this, `active` resets to false on reload and the
+        // user's prior split session is forgotten.
+        const wasActive = active || localStorage.getItem('splitscreenActive') === 'true';
         // In a follower window, never auto-stop split — the follower panel IS
         // the only thing on screen, and we drive its setup ourselves.
         if (!FOLLOWER && active) stopSplitScreen();
@@ -2296,14 +2293,14 @@
                 ssChannel.postMessage({ type: 'song-changed', filename: currentFilename });
             }
 
-            if (!handled && !FOLLOWER && (alwaysSplit || (wasActive && autoReactivate))) {
+            if (!handled && !FOLLOWER && (alwaysSplit || wasActive)) {
                 handled = true;
                 startSplitScreen();
             }
         };
 
         // Fallback: poll for song info in case _onReady was missed
-        if (!FOLLOWER && (alwaysSplit || (wasActive && autoReactivate))) {
+        if (!FOLLOWER && (alwaysSplit || wasActive)) {
             let attempts = 0;
             const poll = setInterval(() => {
                 attempts++;
