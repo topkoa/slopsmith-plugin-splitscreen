@@ -1380,6 +1380,16 @@
     }
 
     function teardownPanels() {
+        // Flip active + notify focus listeners up-front. All callers
+        // (stopSplitScreen, rebuildLayout, popOutPanel, _redockPanel) need
+        // active=false so a follow-up startSplitScreen() passes its
+        // `_starting || active` re-entrancy guard. Centralising the flip
+        // here removes the foot-gun of every restart path remembering to
+        // clear it manually. Plugin destroy() handlers below run against
+        // the inactive world view, which is what they expect when they
+        // read isActive() during cleanup.
+        active = false;
+        _emitFocusChange();
         for (const p of panels) {
             if (p.detector) {
                 p.detector.destroy();
@@ -1538,12 +1548,6 @@
     function rebuildLayout() {
         const wasActive = active;
         const savedPrefs = wasActive ? captureCurrentPrefs() : null;
-        // Flip active BEFORE teardown so the upcoming startSplitScreen
-        // passes its `_starting || active` re-entrancy guard. Mirror the
-        // ordering stopSplitScreen uses (active=false → emit → teardown)
-        // so plugin destroy() runs against the inactive world view.
-        active = false;
-        _emitFocusChange();
         teardownPanels();
         if (wasActive) startSplitScreen(null, savedPrefs);
     }
@@ -1694,14 +1698,14 @@
 
     function stopSplitScreen() {
         savePanelPrefs();
-        // Flip active BEFORE teardown so any plugin destroy() that reads
-        // isActive() during teardownPanels treats itself as transitioning
-        // back to the main-player path. Notify listeners up-front for the
-        // same reason — focus-change handlers should run with the new
-        // (inactive) world view, not the old.
-        active = false;
-        _emitFocusChange();
-        teardownPanels();
+        teardownPanels();  // flips active=false + emits focus change
+        // Defensive clear at full-session-end. Well-behaved plugins
+        // unsubscribe from offFocusChange in their renderer.destroy(),
+        // which runs above as part of teardownPanels. A plugin that
+        // forgets would otherwise accumulate stale callbacks across
+        // sessions; clearing here bounds the leak to the lifetime of
+        // a single split session.
+        focusListeners.clear();
         setRedundantControlsHidden(false);
         restoreHud();
 
