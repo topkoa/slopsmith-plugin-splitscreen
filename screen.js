@@ -1431,6 +1431,22 @@
         return '2d';
     }
 
+    // Decode a captured panel mode into the saved-prefs `arrName` form.
+    // Shared by _redockPanel and _followerCfgToPrefs so the popup-and-back
+    // round-trip produces the same prefs the main-window flow would.
+    //
+    // Legacy: pre-PR-36 popups encoded 3D Highway as cfg.mode === '3d'
+    // rather than 'viz:highway_3d'. Map it explicitly so a popup that was
+    // opened on an older build and is now docking back lands on the
+    // correct renderer instead of silently falling back to 2D.
+    function _modeToArrName(mode, arrNameStr) {
+        if (mode === 'lyrics') return LYRICS_VALUE;
+        if (mode === 'jt') return JUMPING_TAB_VALUE + ':' + arrNameStr;
+        if (mode === '3d') return VIZ_PREFIX + ':highway_3d:' + arrNameStr;
+        if (mode?.startsWith('viz:')) return VIZ_PREFIX + ':' + mode.slice(4) + ':' + arrNameStr;
+        return arrNameStr;
+    }
+
     function _captureFollowerConfig(panel) {
         return {
             arrangement: panel.arrIndex || 0,
@@ -1814,10 +1830,7 @@
         // active, capture the running prefs and append; otherwise start split
         // fresh with just this one panel.
         const merged = Object.assign({}, entry.originalConfig, finalState || {});
-        const arrName = (merged.mode === 'lyrics') ? LYRICS_VALUE
-            : (merged.mode === 'jt') ? (JUMPING_TAB_VALUE + ':' + (arrangements[merged.arrangement]?.name || ''))
-            : merged.mode?.startsWith('viz:') ? (VIZ_PREFIX + ':' + merged.mode.slice(4) + ':' + (arrangements[merged.arrangement]?.name || ''))
-            : (arrangements[merged.arrangement]?.name || '');
+        const arrName = _modeToArrName(merged.mode, arrangements[merged.arrangement]?.name || '');
         const newPrefs = {
             arrName,
             lyrics: true,
@@ -2290,10 +2303,7 @@
     // Convert a captured panel config (cfg) and arrIdx into the prefs
     // shape that initPanel expects.
     function _followerCfgToPrefs(cfg, arrIdx) {
-        const arrName = (cfg.mode === 'lyrics') ? LYRICS_VALUE
-            : (cfg.mode === 'jt') ? (JUMPING_TAB_VALUE + ':' + (arrangements[arrIdx]?.name || ''))
-            : cfg.mode?.startsWith('viz:') ? (VIZ_PREFIX + ':' + cfg.mode.slice(4) + ':' + (arrangements[arrIdx]?.name || ''))
-            : (arrangements[arrIdx]?.name || '');
+        const arrName = _modeToArrName(cfg.mode, arrangements[arrIdx]?.name || '');
         return {
             arrName,
             lyrics: true,
