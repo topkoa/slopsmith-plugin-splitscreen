@@ -1538,6 +1538,12 @@
     function rebuildLayout() {
         const wasActive = active;
         const savedPrefs = wasActive ? captureCurrentPrefs() : null;
+        // Flip active BEFORE teardown so the upcoming startSplitScreen
+        // passes its `_starting || active` re-entrancy guard. Mirror the
+        // ordering stopSplitScreen uses (active=false → emit → teardown)
+        // so plugin destroy() runs against the inactive world view.
+        active = false;
+        _emitFocusChange();
         teardownPanels();
         if (wasActive) startSplitScreen(null, savedPrefs);
     }
