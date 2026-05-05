@@ -71,6 +71,7 @@
         return -1;
     }
 
+    let _vizPluginsFetchFailed = false;
     async function fetchVizPlugins() {
         try {
             const resp = await fetch('/api/plugins');
@@ -82,13 +83,18 @@
         } catch (_) {
             // /api/plugins unavailable — fall back to scanning window for any
             // slopsmithViz_* factories that are already loaded so viz options
-            // remain available even when the plugin registry can't be fetched
-            // (preserves prior behaviour where 3D Highway was discoverable
-            // by direct factory check alone).
-            vizPlugins = Object.keys(window)
-                .filter(k => k.startsWith('slopsmithViz_') && typeof window[k] === 'function')
-                .map(k => ({ id: k.slice('slopsmithViz_'.length), name: k.slice('slopsmithViz_'.length) }));
+            // remain available even when the plugin registry can't be fetched.
+            // Mark fetch as failed so populateSelect re-scans on every build,
+            // preserving the "deferred plugin scripts are reflected" property
+            // even without a registry endpoint.
+            _vizPluginsFetchFailed = true;
+            _rescanVizPluginsFromWindow();
         }
+    }
+    function _rescanVizPluginsFromWindow() {
+        vizPlugins = Object.keys(window)
+            .filter(k => k.startsWith('slopsmithViz_') && typeof window[k] === 'function')
+            .map(k => ({ id: k.slice('slopsmithViz_'.length), name: k.slice('slopsmithViz_'.length) }));
     }
     // Keep the promise so startSplitScreen / loadSongInFollower can await it —
     // panels are never populated before the list is ready even on a fast first
@@ -257,21 +263,38 @@
         }
     }
 
+    // Migration version marker so one-time resets (e.g. the lyrics-overlay
+    // semantics flip) only run on prefs written by older code. Without this
+    // gate, a per-load migration would clobber the user's actual toggle
+    // state every reload — the overlay-on choice could never persist.
+    const PREFS_MIGRATION_KEY = 'splitscreenPrefsMigrationV';
+    const PREFS_CURRENT_V = 2;
+
     function migratePanelPrefs(prefs) {
         if (!Array.isArray(prefs)) return prefs;
-        return prefs.map(p => {
-            // Force lyrics overlay off for ALL panels regardless of saved
-            // value. The previous `lyrics` field tracked highway's
-            // built-in setLyricsVisible (which defaulted to true), so
-            // existing users would otherwise inherit overlay-on after the
-            // semantic switch to a user-driven top-anchored overlay. Reset
-            // once; user toggles per-panel from here.
-            const next = { ...p, lyrics: false };
+        let v = 0;
+        try { v = parseInt(localStorage.getItem(PREFS_MIGRATION_KEY) || '0', 10) || 0; }
+        catch (_) {}
+        const needsLyricsReset = v < 2;
+        const out = prefs.map(p => {
+            const next = { ...p };
+            // v < 2: previous `lyrics` field tracked highway's built-in
+            // setLyricsVisible (defaulted to true). The new overlay-driven
+            // toggle inherits that field, so existing users would otherwise
+            // see overlay-on everywhere on first load. Reset once; from then
+            // on the user-driven value round-trips normally.
+            if (needsLyricsReset) next.lyrics = false;
+            // Legacy 3D-Highway sentinel migration (pre-PR-36).
             if (next.arrName?.startsWith('__3d_highway__:')) {
                 next.arrName = VIZ_PREFIX + ':highway_3d:' + next.arrName.slice('__3d_highway__:'.length);
             }
             return next;
         });
+        if (v < PREFS_CURRENT_V) {
+            try { localStorage.setItem(PREFS_MIGRATION_KEY, String(PREFS_CURRENT_V)); }
+            catch (_) {}
+        }
+        return out;
     }
 
     function resolveArrIndex(arrName) {
@@ -892,6 +915,12 @@
 
     // ── Panel lifecycle ──
     function populateSelect(panel, arrIndex) {
+        // If /api/plugins fetch failed earlier, re-scan window for viz
+        // factories every time the dropdown is built — covers viz plugin
+        // scripts that load asynchronously after splitscreen first opened.
+        // No-op when the registry fetch succeeded (vizPlugins is the
+        // authoritative metadata list including names that aren't on window).
+        if (_vizPluginsFetchFailed) _rescanVizPluginsFromWindow();
         panel.select.innerHTML = '';
         arrangements.forEach((a, i) => {
             const opt = document.createElement('option');
@@ -1147,8 +1176,19 @@
         const vizFactoryFn = isVizMode && savedVizPluginId
             ? window['slopsmithViz_' + savedVizPluginId]
             : null;
+        // Guard the factory call. A buggy viz plugin throwing here would
+        // bubble out of initPanel and abort the entire splitscreen start
+        // (caught only by startSplitScreen's catch — every panel torn down
+        // because one viz factory threw). Fall back to default 2D for just
+        // this panel instead.
+        let vizInstalled = false;
         if (typeof vizFactoryFn === 'function') {
-            panel.hw.setRenderer(vizFactoryFn());
+            try {
+                panel.hw.setRenderer(vizFactoryFn());
+                vizInstalled = true;
+            } catch (e) {
+                console.error('[splitscreen] viz factory threw for', savedVizPluginId, '— falling back to 2D for panel:', e);
+            }
         }
 
         panel.hw.init(panel.canvas);
@@ -1203,7 +1243,7 @@
 
         panel.arrName.textContent = isLyricsMode ? 'Lyrics'
             : isJumpingTabMode ? 'Jumping Tab'
-            : (isVizMode && typeof vizFactoryFn === 'function') ? (arrangements[panel.arrIndex]?.name || '') + ' (viz)'
+            : (isVizMode && vizInstalled) ? (arrangements[panel.arrIndex]?.name || '') + ' (viz)'
             : (arrangements[panel.arrIndex]?.name || '');
 
         panel.select.onchange = () => {
@@ -1338,10 +1378,11 @@
             enterLyricsMode(panel);
         } else if (isJumpingTabMode) {
             enterJumpingTabMode(panel);
-        } else if (isVizMode && savedVizPluginId &&
-                   typeof window['slopsmithViz_' + savedVizPluginId] === 'function') {
+        } else if (isVizMode && vizInstalled) {
             // Renderer was already installed before hw.init above; pass true to
-            // skip the redundant setRenderer call inside enterVizMode.
+            // skip the redundant setRenderer call inside enterVizMode. If the
+            // factory threw earlier (vizInstalled=false), fall through to the
+            // plain-2D else-branch so the panel still gets a working highway.
             enterVizMode(panel, savedVizPluginId, /* rendererPreInstalled */ true);
         } else {
             // Connect WebSocket. Pass an empty onSongInfo so core skips its
