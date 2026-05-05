@@ -34,6 +34,7 @@
     let arrangements = []; // arrangement list from song_info
     let vizPlugins   = []; // {id, name, ...} — type=visualization plugins from /api/plugins
     let _starting    = false; // re-entrancy guard for startSplitScreen
+    let _pendingRebuild = false; // rebuildLayout requested while a start is in flight
 
     // Focus model — which panel currently "owns" multi-instance plugin
     // resources (MIDI input routing for piano, settings-gear placement, etc).
@@ -1562,6 +1563,14 @@
 
     // ── Main toggle ──
     function rebuildLayout() {
+        // A start is in flight (e.g. user changed the layout select while the
+        // initial start was awaiting _vizPluginsReady). Tearing down now would
+        // race the in-flight panel-build; defer until the start finishes and
+        // its `finally` block re-fires us.
+        if (_starting) {
+            _pendingRebuild = true;
+            return;
+        }
         const wasActive = active;
         const savedPrefs = wasActive ? captureCurrentPrefs() : null;
         teardownPanels();
@@ -1707,8 +1716,33 @@
 
         // Hook into the time sync loop
         startTimeSync();
+        } catch (err) {
+            // Rollback any partial state so the UI doesn't get stuck with
+            // active=true, default highway hidden, and no panels — that's
+            // the worst case (nothing renders, Split button thinks split is
+            // running, toggle is now a no-op). teardownPanels handles the
+            // active flip + plugin destroy; restore the chrome we mutated
+            // up in the try block too.
+            console.error('startSplitScreen failed:', err);
+            teardownPanels();
+            const defaultCanvas = document.getElementById('highway');
+            if (defaultCanvas) defaultCanvas.style.display = '';
+            const controls = document.getElementById('player-controls');
+            if (controls) {
+                controls.style.zIndex = '10';
+                controls.style.marginTop = '';
+            }
+            updateBtn();
+            stopTimeSync();
         } finally {
             _starting = false;
+            // Drain a queued rebuild from rebuildLayout. Only fire if the
+            // session is still active — a failed start above already did
+            // a full teardown, in which case there's nothing to rebuild.
+            if (_pendingRebuild) {
+                _pendingRebuild = false;
+                if (active) rebuildLayout();
+            }
         }
     }
 
