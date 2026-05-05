@@ -240,7 +240,7 @@
                 : p.vizMode
                 ? VIZ_PREFIX + ':' + p.vizMode + ':' + (arrangements[p.arrIndex]?.name || '')
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
-            lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
+            lyrics: !!p.lyricsOverlayOn,
             inverted: p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
             barHidden: p.bar.style.display === 'none',
@@ -260,10 +260,17 @@
     function migratePanelPrefs(prefs) {
         if (!Array.isArray(prefs)) return prefs;
         return prefs.map(p => {
-            if (p?.arrName?.startsWith('__3d_highway__:')) {
-                return { ...p, arrName: VIZ_PREFIX + ':highway_3d:' + p.arrName.slice('__3d_highway__:'.length) };
+            // Force lyrics overlay off for ALL panels regardless of saved
+            // value. The previous `lyrics` field tracked highway's
+            // built-in setLyricsVisible (which defaulted to true), so
+            // existing users would otherwise inherit overlay-on after the
+            // semantic switch to a user-driven top-anchored overlay. Reset
+            // once; user toggles per-panel from here.
+            const next = { ...p, lyrics: false };
+            if (next.arrName?.startsWith('__3d_highway__:')) {
+                next.arrName = VIZ_PREFIX + ':highway_3d:' + next.arrName.slice('__3d_highway__:'.length);
             }
-            return p;
+            return next;
         });
     }
 
@@ -308,13 +315,25 @@
     //  Lyrics-only pane renderer
     // ══════════════════════════════════════════════════════════════════════
 
-    function createLyricsPane(container) {
+    function createLyricsPane(container, opts) {
+        const overlay = !!(opts && opts.overlay);
         const el = document.createElement('div');
-        el.className = 'splitscreen-lyrics-pane';
-        el.style.cssText =
-            'position:absolute;top:0;left:0;right:0;bottom:0;' +
-            'display:flex;flex-direction:column;justify-content:center;align-items:center;' +
-            'background:#08080e;padding:24px;overflow:hidden;';
+        el.className = overlay ? 'splitscreen-lyrics-overlay' : 'splitscreen-lyrics-pane';
+        // Overlay mode: top-anchored translucent band that floats above
+        // whatever renderer owns the canvas (default 2D, piano, drums, 3D
+        // Highway, ...). z-index 9 sits above bar (7) and barToggleBtn (8)
+        // so lyrics are always on top regardless of viz. pointer-events:none
+        // so toggles/clicks under it (including the canvas) still work.
+        // Full-pane mode: opaque, fills the panel — used for lyrics-only
+        // mode (canvas hidden), unchanged from before.
+        el.style.cssText = overlay
+            ? 'position:absolute;top:0;left:0;right:0;height:auto;' +
+              'display:flex;flex-direction:column;justify-content:center;align-items:center;' +
+              'background:rgba(8,8,16,0.78);padding:10px 16px;overflow:hidden;' +
+              'pointer-events:none;z-index:9;'
+            : 'position:absolute;top:0;left:0;right:0;bottom:0;' +
+              'display:flex;flex-direction:column;justify-content:center;align-items:center;' +
+              'background:#08080e;padding:24px;overflow:hidden;';
         container.appendChild(el);
 
         let lyrics = [];
@@ -433,13 +452,17 @@
             el.innerHTML = '';
 
             const curDiv = document.createElement('div');
-            curDiv.style.cssText = 'font-size:clamp(20px, 4vw, 48px);font-weight:600;text-align:center;line-height:1.4;transition:opacity 0.3s;';
+            curDiv.style.cssText = overlay
+                ? 'font-size:clamp(14px, 2vw, 22px);font-weight:600;text-align:center;line-height:1.3;transition:opacity 0.3s;'
+                : 'font-size:clamp(20px, 4vw, 48px);font-weight:600;text-align:center;line-height:1.4;transition:opacity 0.3s;';
             curDiv.appendChild(renderLine(currentLine, t));
             el.appendChild(curDiv);
 
             if (nextLine && gapToNext <= 4.0) {
                 const nextDiv = document.createElement('div');
-                nextDiv.style.cssText = 'font-size:clamp(16px, 3vw, 36px);font-weight:400;text-align:center;line-height:1.4;margin-top:16px;color:#444;';
+                nextDiv.style.cssText = overlay
+                    ? 'font-size:clamp(11px, 1.5vw, 17px);font-weight:400;text-align:center;line-height:1.3;margin-top:4px;color:#444;'
+                    : 'font-size:clamp(16px, 3vw, 36px);font-weight:400;text-align:center;line-height:1.4;margin-top:16px;color:#444;';
                 nextDiv.appendChild(renderLine(nextLine, t));
                 el.appendChild(nextDiv);
             }
@@ -728,12 +751,25 @@
     // can fire after the arrays are cleared, leaking the previous chart's data
     // into the new arrangement. Replacing the highway instance entirely orphans
     // the old closure so late messages can't pollute the new chart.
-    function recreatePanelHighway(panel) {
+    function recreatePanelHighway(panel, opts) {
         const old = panel.hw;
         const inverted = old.getInverted();
         const lyricsVisible = typeof old.getLyricsVisible === 'function' ? old.getLyricsVisible() : true;
         const mastery = old.getMastery();
         old.stop();
+
+        // Replace the canvas element so the new renderer can acquire its
+        // context type on a FRESH canvas. Browsers permanently lock a canvas
+        // to its first context type — a canvas that previously got
+        // getContext('2d') silently returns null for getContext('webgl'),
+        // and vice versa. Reusing the old canvas across renderer types
+        // would break WebGL viz plugins on 2D↔viz and viz↔viz arrangement
+        // switches; replacing the element sidesteps the lock entirely.
+        const oldCanvas = panel.canvas;
+        const newCanvas = document.createElement('canvas');
+        newCanvas.style.cssText = oldCanvas.style.cssText || 'width:100%;height:100%;display:block;';
+        oldCanvas.replaceWith(newCanvas);
+        panel.canvas = newCanvas;
 
         const hw = createHighway();
         hw.resize = function () {
@@ -749,6 +785,12 @@
             c.width = Math.round(w * scale);
             c.height = Math.round(h * scale);
         };
+        // Pre-install the renderer BEFORE hw.init so the canvas locks to the
+        // correct context type (e.g. WebGL for 3D Highway) on first init.
+        // Same restore-on-load technique used by initPanel for saved viz prefs.
+        if (opts?.preInstallRenderer) {
+            hw.setRenderer(opts.preInstallRenderer);
+        }
         hw.init(panel.canvas);
         hw.setInverted(inverted);
         if (typeof hw.setLyricsVisible === 'function') hw.setLyricsVisible(lyricsVisible);
@@ -1017,11 +1059,14 @@
         // before hw.init (restore-on-load path) to avoid creating a redundant
         // renderer instance and to respect the canvas context-type lock order.
         if (!rendererPreInstalled) {
-            // Recreate the highway on the same canvas so the previous 2D context
-            // is discarded before the viz renderer (potentially WebGL) takes over.
-            // Same mitigation used for viz-to-viz arrangement switches.
-            recreatePanelHighway(panel);
-            panel.hw.setRenderer(window['slopsmithViz_' + pluginId]());
+            // Recreate the highway with a fresh canvas + the viz renderer
+            // pre-installed so the canvas locks to the renderer's context
+            // type (WebGL for 3D Highway, 2D for piano/drums) on first init.
+            // Without the pre-install, recreatePanelHighway's hw.init would
+            // try the default 2D context and silently break WebGL viz.
+            recreatePanelHighway(panel, {
+                preInstallRenderer: window['slopsmithViz_' + pluginId](),
+            });
         }
         hookPanelReady(panel);
         panel.hw.connect(getWsUrl(currentFilename, panel.arrIndex), { onSongInfo: () => {} });
@@ -1089,6 +1134,8 @@
         }
         panel.lyricsMode = false;
         panel.lyricsPane = null;
+        panel.lyricsOverlay = null;
+        panel.lyricsOverlayOn = false;
         panel.jumpingTabMode = false;
         panel.jumpingTabPane = null;
         panel.jumpingTabContainer = null;
@@ -1178,13 +1225,15 @@
                 const vizIdx   = parseInt(parts[2]);
                 panel.arrIndex = vizIdx;
                 if (panel.vizMode) {
-                    // Clear the current renderer before recreating so it can
-                    // release its resources (WebGL context, event listeners).
+                    // Clear the current renderer so it can release its
+                    // resources (WebGL context, event listeners), then
+                    // recreate the highway with the new renderer pre-installed
+                    // — the fresh canvas locks to the new context type, and
+                    // the orphaned old WS can't leak notes into the new chart.
                     panel.hw.setRenderer(null);
-                    // Already in viz mode — recreate hw to avoid the old WS leaking
-                    // notes from the previous arrangement into the new one.
-                    recreatePanelHighway(panel);
-                    panel.hw.setRenderer(window['slopsmithViz_' + pluginId]());
+                    recreatePanelHighway(panel, {
+                        preInstallRenderer: window['slopsmithViz_' + pluginId](),
+                    });
                     hookPanelReady(panel);
                     panel.hw.connect(getWsUrl(currentFilename, vizIdx), { onSongInfo: () => {} });
                     panel.vizMode = pluginId;
@@ -1228,21 +1277,36 @@
             savePanelPrefs();
         };
 
-        // Per-panel lyrics toggle (uses highway factory's per-instance showLyrics)
-        const hasLyricsApi = typeof panel.hw.setLyricsVisible === 'function';
-        if (hasLyricsApi) {
-            panel.updateLyricsStyle(panel.hw.getLyricsVisible());
-            panel.lyricsBtn.onclick = () => {
-                const on = !panel.hw.getLyricsVisible();
+        // Per-panel lyrics toggle. Always renders a transparent overlay band
+        // anchored to top of the panel (z-index above bar + viz renderers),
+        // so it works regardless of which renderer (2D, piano, drums, 3D
+        // Highway, future viz) owns the canvas. Future-proof: any new viz
+        // plugin gets lyric support for free without modification.
+        // Also keeps the highway's built-in setLyricsVisible (in-canvas
+        // underline cue) in sync — complementary to the overlay text.
+        panel.lyricsOverlayOn = prefs?.lyrics === true;
+        const _toggleLyricsOverlay = (on) => {
+            if (on) {
+                if (panel.lyricsOverlay) panel.lyricsOverlay.destroy();
+                panel.lyricsOverlay = createLyricsPane(panel.panelDiv, { overlay: true });
+                panel.lyricsOverlay.connect(currentFilename, panel.arrIndex);
+            } else if (panel.lyricsOverlay) {
+                panel.lyricsOverlay.destroy();
+                panel.lyricsOverlay.el.remove();
+                panel.lyricsOverlay = null;
+            }
+            if (typeof panel.hw.setLyricsVisible === 'function') {
                 panel.hw.setLyricsVisible(on);
-                panel.updateLyricsStyle(on);
-                savePanelPrefs();
-            };
-        } else {
-            panel.lyricsBtn.disabled = true;
-            panel.lyricsBtn.title = 'Highway lyrics API not available';
-            panel.lyricsBtn.style.opacity = '0.4';
-        }
+            }
+            panel.updateLyricsStyle(on);
+        };
+        if (panel.lyricsOverlayOn) _toggleLyricsOverlay(true);
+        else panel.updateLyricsStyle(false);
+        panel.lyricsBtn.onclick = () => {
+            panel.lyricsOverlayOn = !panel.lyricsOverlayOn;
+            _toggleLyricsOverlay(panel.lyricsOverlayOn);
+            savePanelPrefs();
+        };
 
         // Per-panel Highway/Tab mode toggle (uses tabview factory)
         const hasTabFactory = typeof window.createTabView === 'function';
@@ -1405,6 +1469,11 @@
                 p.lyricsPane.destroy();
                 p.lyricsPane = null;
             }
+            if (p.lyricsOverlay) {
+                p.lyricsOverlay.destroy();
+                p.lyricsOverlay.el.remove();
+                p.lyricsOverlay = null;
+            }
             if (p.jumpingTabPane) {
                 p.jumpingTabPane.destroy();
                 p.jumpingTabPane = null;
@@ -1519,7 +1588,7 @@
                 : p.vizMode
                 ? VIZ_PREFIX + ':' + p.vizMode + ':' + (arrangements[p.arrIndex]?.name || '')
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
-            lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
+            lyrics: !!p.lyricsOverlayOn,
             inverted: p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
             barHidden: p.bar.style.display === 'none',
@@ -1589,7 +1658,7 @@
                 : p.vizMode
                 ? VIZ_PREFIX + ':' + p.vizMode + ':' + (arrangements[p.arrIndex]?.name || '')
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
-            lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
+            lyrics: !!p.lyricsOverlayOn,
             inverted: p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
             barHidden: p.bar.style.display === 'none',
@@ -1726,17 +1795,23 @@
             // active=true, default highway hidden, and no panels — that's
             // the worst case (nothing renders, Split button thinks split is
             // running, toggle is now a no-op). teardownPanels handles the
-            // active flip + plugin destroy; restore the chrome we mutated
-            // up in the try block too.
+            // active flip + plugin destroy; mirror stopSplitScreen for the
+            // rest of the chrome resets so a partially-applied "split mode"
+            // doesn't survive the failure.
             console.error('startSplitScreen failed:', err);
             teardownPanels();
+            setRedundantControlsHidden(false);
+            restoreHud();
             const defaultCanvas = document.getElementById('highway');
             if (defaultCanvas) defaultCanvas.style.display = '';
             const controls = document.getElementById('player-controls');
             if (controls) {
+                if (controlsHidden) controls.style.display = '';
                 controls.style.zIndex = '10';
                 controls.style.marginTop = '';
             }
+            controlsHidden = false;
+            if (floatBtn) floatBtn.style.display = 'none';
             updateBtn();
             stopTimeSync();
         } finally {
