@@ -1371,8 +1371,12 @@
             }
             panel.updateLyricsStyle(on);
         };
-        if (panel.lyricsOverlayOn) _toggleLyricsOverlay(true);
-        else panel.updateLyricsStyle(false);
+        // Always invoke _toggleLyricsOverlay so the highway's built-in
+        // lyricsVisible flag (which feeds bundle.lyricsVisible consumed by
+        // viz renderers like 3D highway) is synced to the saved toggle
+        // state. Without this, viz panels with overlay off would still
+        // render lyrics because the built-in flag defaults to true.
+        _toggleLyricsOverlay(panel.lyricsOverlayOn);
         panel.lyricsBtn.onclick = () => {
             panel.lyricsOverlayOn = !panel.lyricsOverlayOn;
             _toggleLyricsOverlay(panel.lyricsOverlayOn);
