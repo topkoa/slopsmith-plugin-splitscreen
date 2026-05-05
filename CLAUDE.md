@@ -71,12 +71,15 @@ screen.js
 ```js
 {
   arrName: string,       // arrangement name, or LYRICS_VALUE / JUMPING_TAB_VALUE:arrName / VIZ_PREFIX:pluginId:arrName
-  lyrics: bool,          // per-panel highway lyrics toggle state
+  lyrics: bool,          // per-panel lyrics overlay toggle (top-anchored translucent band; works in any renderer)
   inverted: bool,        // panel invert state
   detectChannel: string, // 'mono' | 'left' | 'right'
   barHidden: bool,       // whether the panel's mini control bar is hidden
+  mastery: number,       // master-difficulty fraction 0..1 (0=easy, 1=full chart)
 }
 ```
+
+`lyrics` previously tracked the highway's built-in `setLyricsVisible()` (defaulted to true). The semantic switched in PR #36 to drive the panel-owned lyrics overlay (a translucent band layered above whatever renderer owns the canvas). `migratePanelPrefs` force-resets it to `false` once on first read of pre-PR-36 prefs (gated by `splitscreenPrefsMigrationV` localStorage key) so existing users don't inherit overlay-on everywhere.
 
 Old `__3d_highway__:arrName` entries from pre-Wave C builds are migrated to `__viz__:highway_3d:arrName` on read by `migratePanelPrefs()`.
 

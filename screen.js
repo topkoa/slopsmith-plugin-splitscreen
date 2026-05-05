@@ -125,12 +125,17 @@
             const params = new URLSearchParams(window.location.search);
             if (params.get('ssFollower') !== '1') return null;
             const cfg = {
-                popupId:     params.get('popupId') || '',
-                filename:    params.get('filename') || '',
-                arrangement: parseInt(params.get('arrangement'), 10) || 0,
-                mode:        params.get('mode') || '2d',
-                inverted:    params.get('inverted') === '1',
-                mastery:     parseFloat(params.get('mastery')),
+                popupId:       params.get('popupId') || '',
+                filename:      params.get('filename') || '',
+                arrangement:   parseInt(params.get('arrangement'), 10) || 0,
+                mode:          params.get('mode') || '2d',
+                inverted:      params.get('inverted') === '1',
+                mastery:       parseFloat(params.get('mastery')),
+                // User-driven per-panel toggles forwarded by the spawning
+                // window so the popup mirrors the source panel's state.
+                lyrics:        params.get('lyrics') === '1',
+                barHidden:     params.get('barHidden') === '1',
+                detectChannel: params.get('detectChannel') || 'mono',
             };
             if (!cfg.filename) return null;
             return cfg;
@@ -1088,14 +1093,24 @@
         // before hw.init (restore-on-load path) to avoid creating a redundant
         // renderer instance and to respect the canvas context-type lock order.
         if (!rendererPreInstalled) {
+            // Build the renderer instance FIRST so a throwing factory
+            // doesn't tear down the highway / canvas before we know it
+            // works. On throw, restore the buttons we just hid and bail
+            // — panel keeps its previous (now-2D-after-exit*) highway.
+            let newRenderer;
+            try {
+                newRenderer = window['slopsmithViz_' + pluginId]();
+            } catch (e) {
+                console.error('[splitscreen] viz factory threw for', pluginId, '— staying in 2D:', e);
+                panel.tabBtn.style.display = '';
+                return;
+            }
             // Recreate the highway with a fresh canvas + the viz renderer
             // pre-installed so the canvas locks to the renderer's context
             // type (WebGL for 3D Highway, 2D for piano/drums) on first init.
             // Without the pre-install, recreatePanelHighway's hw.init would
             // try the default 2D context and silently break WebGL viz.
-            recreatePanelHighway(panel, {
-                preInstallRenderer: window['slopsmithViz_' + pluginId](),
-            });
+            recreatePanelHighway(panel, { preInstallRenderer: newRenderer });
         }
         hookPanelReady(panel);
         panel.hw.connect(getWsUrl(currentFilename, panel.arrIndex), { onSongInfo: () => {} });
@@ -1265,15 +1280,25 @@
                 const vizIdx   = parseInt(parts[2]);
                 panel.arrIndex = vizIdx;
                 if (panel.vizMode) {
+                    // Build the new renderer first so a throwing factory
+                    // doesn't leave the panel half-torn-down. On throw,
+                    // fall through to a default 2D highway for vizIdx so
+                    // the panel still has a working chart.
+                    let newRenderer;
+                    try {
+                        newRenderer = window['slopsmithViz_' + pluginId]();
+                    } catch (e) {
+                        console.error('[splitscreen] viz factory threw for', pluginId, '— falling back to 2D:', e);
+                        exitVizMode(panel, vizIdx);
+                        return;
+                    }
                     // Clear the current renderer so it can release its
                     // resources (WebGL context, event listeners), then
                     // recreate the highway with the new renderer pre-installed
                     // — the fresh canvas locks to the new context type, and
                     // the orphaned old WS can't leak notes into the new chart.
                     panel.hw.setRenderer(null);
-                    recreatePanelHighway(panel, {
-                        preInstallRenderer: window['slopsmithViz_' + pluginId](),
-                    });
+                    recreatePanelHighway(panel, { preInstallRenderer: newRenderer });
                     hookPanelReady(panel);
                     panel.hw.connect(getWsUrl(currentFilename, vizIdx), { onSongInfo: () => {} });
                     panel.vizMode = pluginId;
@@ -1329,7 +1354,11 @@
             if (on) {
                 if (panel.lyricsOverlay) panel.lyricsOverlay.destroy();
                 panel.lyricsOverlay = createLyricsPane(panel.panelDiv, { overlay: true });
-                panel.lyricsOverlay.connect(currentFilename, panel.arrIndex);
+                // Connect with arrangement 0 — lyrics are song-level (same
+                // across arrangements) and this matches enterLyricsMode's
+                // full-pane connect, so the overlay doesn't need to
+                // reconnect when the user switches arrangement on the panel.
+                panel.lyricsOverlay.connect(currentFilename, 0);
             } else if (panel.lyricsOverlay) {
                 panel.lyricsOverlay.destroy();
                 panel.lyricsOverlay.el.remove();
@@ -1569,6 +1598,12 @@
             mode:        _captureMode(panel),
             inverted:    panel.hw.getInverted() ? 1 : 0,
             mastery:     panel.hw.getMastery(),
+            // User-driven per-panel toggles that should survive a pop-out /
+            // dock round-trip. Without these, docking always forces lyrics on
+            // and bar visible regardless of pre-popout state.
+            lyrics:        !!panel.lyricsOverlayOn,
+            barHidden:     panel.bar?.style.display === 'none',
+            detectChannel: panel.detectChannel || 'mono',
         };
     }
 
@@ -1602,6 +1637,9 @@
         sp.set('arrangement', String(cfg.arrangement));
         sp.set('mode', cfg.mode);
         sp.set('inverted', String(cfg.inverted));
+        sp.set('lyrics', cfg.lyrics ? '1' : '0');
+        sp.set('barHidden', cfg.barHidden ? '1' : '0');
+        sp.set('detectChannel', cfg.detectChannel || 'mono');
         if (Number.isFinite(cfg.mastery)) sp.set('mastery', String(cfg.mastery));
 
         const popup = window.open(url.toString(), popupId, 'popup,width=1280,height=420');
@@ -1988,10 +2026,13 @@
         const arrName = _modeToArrName(merged.mode, arrangements[merged.arrangement]?.name || '');
         const newPrefs = {
             arrName,
-            lyrics: true,
+            // Restore the per-panel toggles captured at pop-out time (and
+            // optionally overlaid with whatever the popup last reported via
+            // finalState) instead of forcing fresh defaults.
+            lyrics: !!merged.lyrics,
             inverted: !!merged.inverted,
-            detectChannel: 'mono',
-            barHidden: false,
+            detectChannel: merged.detectChannel || 'mono',
+            barHidden: !!merged.barHidden,
             mastery: Number.isFinite(merged.mastery) ? merged.mastery : 1,
         };
 
@@ -2461,10 +2502,14 @@
         const arrName = _modeToArrName(cfg.mode, arrangements[arrIdx]?.name || '');
         return {
             arrName,
-            lyrics: true,
+            // Use the captured per-panel toggles when present so the follower
+            // window mirrors the source panel's lyrics/bar/detect state.
+            // Older popups that didn't include these fields fall back to
+            // sane defaults.
+            lyrics: !!cfg.lyrics,
             inverted: !!cfg.inverted,
-            detectChannel: 'mono',
-            barHidden: false,
+            detectChannel: cfg.detectChannel || 'mono',
+            barHidden: !!cfg.barHidden,
             mastery: Number.isFinite(cfg.mastery) ? cfg.mastery : 1,
         };
     }
