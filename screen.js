@@ -35,6 +35,41 @@
     let vizPlugins   = []; // {id, name, ...} — type=visualization plugins from /api/plugins
     let _starting    = false; // re-entrancy guard for startSplitScreen
 
+    // Focus model — which panel currently "owns" multi-instance plugin
+    // resources (MIDI input routing for piano, settings-gear placement, etc).
+    // Defaults to panel 0; clicking another panel transfers focus.
+    let focusedPanelIdx = 0;
+    const focusListeners = new Set();
+    function _focusedPanel() {
+        if (!active || !panels.length) return null;
+        if (focusedPanelIdx >= panels.length) focusedPanelIdx = 0;
+        return panels[focusedPanelIdx];
+    }
+    function _emitFocusChange() {
+        for (const fn of focusListeners) {
+            try { fn(); } catch (_) { /* listener errors must not break peers */ }
+        }
+    }
+    function _applyFocusBorder() {
+        for (let i = 0; i < panels.length; i++) {
+            panels[i].panelDiv.style.borderColor = i === focusedPanelIdx ? '#4080e0' : '#333';
+        }
+    }
+    function _setFocusedPanel(idx) {
+        if (idx < 0 || idx >= panels.length) return;
+        if (idx === focusedPanelIdx) return;
+        focusedPanelIdx = idx;
+        _applyFocusBorder();
+        _emitFocusChange();
+    }
+    function _findPanelIdxByCanvas(canvas) {
+        if (!canvas) return -1;
+        for (let i = 0; i < panels.length; i++) {
+            if (panels[i].canvas === canvas) return i;
+        }
+        return -1;
+    }
+
     async function fetchVizPlugins() {
         try {
             const resp = await fetch('/api/plugins');
@@ -110,12 +145,51 @@
     // by panel index, and calls panelIndexFor(canvas) to resolve which panel
     // a canvas belongs to).
     window.slopsmithSplitscreen = {
+        // Active state — false during normal main-player operation. Plugins
+        // gate their splitscreen-aware code paths on this so they fall back
+        // to the single-instance main-player path when the user isn't split.
+        isActive() { return active; },
+
+        // Identify a panel by the highway canvas its renderer received in init().
         panelIndexFor(canvas) {
             if (!active) return null;
-            for (let i = 0; i < panels.length; i++) {
-                if (panels[i].canvas === canvas) return i;
-            }
-            return null;
+            const i = _findPanelIdxByCanvas(canvas);
+            return i === -1 ? null : i;
+        },
+
+        // Container element for per-panel chrome/overlays. Plugins that mount
+        // their own DOM (piano overlay canvas, drums HUD) anchor against this
+        // so the overlay sizes to the panel rect, not the whole #player.
+        panelChromeFor(canvas) {
+            if (!active) return null;
+            const i = _findPanelIdxByCanvas(canvas);
+            return i === -1 ? null : panels[i].panelDiv;
+        },
+
+        // Anchor for per-panel settings buttons (e.g. piano gear button).
+        // The mini control bar is the natural place — already visible, already
+        // panel-scoped, already used for invert/lyrics/tab/detect toggles.
+        settingsAnchorFor(canvas) {
+            if (!active) return null;
+            const i = _findPanelIdxByCanvas(canvas);
+            return i === -1 ? null : panels[i].bar;
+        },
+
+        // True when this canvas's panel is the focused one. Plugins use this
+        // to route shared input (e.g. MIDI keyboard) to a single instance.
+        isCanvasFocused(canvas) {
+            if (!active) return true; // no panels => main-player single instance
+            const i = _findPanelIdxByCanvas(canvas);
+            if (i === -1) return false;
+            if (focusedPanelIdx >= panels.length) focusedPanelIdx = 0;
+            return i === focusedPanelIdx;
+        },
+
+        onFocusChange(fn) {
+            if (typeof fn === 'function') focusListeners.add(fn);
+        },
+        offFocusChange(fn) {
+            focusListeners.delete(fn);
         },
     };
 
@@ -449,7 +523,7 @@
             'position:absolute;bottom:0;left:0;right:0;' +
             'display:flex;align-items:center;gap:10px;padding:4px 8px;' +
             'flex-wrap:nowrap;overflow:hidden;' +
-            'background:rgba(8,8,16,0.85);z-index:5;';
+            'background:rgba(8,8,16,0.85);z-index:7;';
 
         // Panel label
         const label = document.createElement('span');
@@ -593,7 +667,7 @@
 
         const barToggleBtn = document.createElement('button');
         barToggleBtn.style.cssText =
-            'position:absolute;bottom:0;right:0;z-index:6;' +
+            'position:absolute;bottom:0;right:0;z-index:8;' +
             'display:flex;align-items:center;justify-content:center;' +
             'padding:2px 6px;border-radius:4px 0 0 0;cursor:pointer;' +
             'background:rgba(64,128,224,0.85);border:none;' +
@@ -601,6 +675,15 @@
         barToggleBtn.textContent = '▾ Bar';
         barToggleBtn.title = 'Hide panel controls';
         panelDiv.appendChild(barToggleBtn);
+
+        // Click-to-focus. Pointerdown (capture) so it fires before any inner
+        // control swallows the event. Resolves the panel by index at fire
+        // time — `panels` is rebuilt by rebuildLayout, so the closure can't
+        // capture a stable panel reference here.
+        panelDiv.addEventListener('pointerdown', () => {
+            const i = panels.findIndex(p => p.panelDiv === panelDiv);
+            if (i !== -1) _setFocusedPanel(i);
+        }, true);
 
         container.appendChild(panelDiv);
 
@@ -1525,6 +1608,24 @@
             arrDefaults = getDefaultArrangements(cfg.panels);
         }
 
+        // Flip active BEFORE the panel-init loop. initPanel may install a
+        // viz renderer (e.g. piano) whose init() calls back into
+        // window.slopsmithSplitscreen.panelChromeFor() / settingsAnchorFor().
+        // Those gate on isActive(); if active flips true only after the loop,
+        // the renderer mounts to #player (main-player fast path) on the first
+        // entry and is stuck full-screen until the next start cycle.
+        active = true;
+        focusedPanelIdx = 0;
+
+        // Size the wrap NOW so panelDivs have a real rect during initPanel.
+        // sizeCanvases() runs at end of start, but viz renderers (piano,
+        // drums) measure panelChrome.clientWidth/Height in their init() —
+        // a wrap with no `bottom` set has height:auto = 0 → panelDiv 50%
+        // of 0 = 0 → renderer's bitmap = 0x0 → CSS upscales = pixelated.
+        const initialControls = document.getElementById('player-controls');
+        const initialControlsH = initialControls ? initialControls.offsetHeight : 0;
+        container.style.bottom = initialControlsH + 'px';
+
         for (let i = 0; i < cfg.panels; i++) {
             const parts = createPanel(i, container, layout);
             const hw = createHighway();
@@ -1564,7 +1665,10 @@
         }
 
         sizeCanvases();
-        active = true;
+        // Paint focus border + notify any listeners that registered during
+        // the per-panel init pass (piano subscribes from its init()).
+        _applyFocusBorder();
+        _emitFocusChange();
         updateBtn();
         setRedundantControlsHidden(true);
         // HUD: visible while loaded; fades out when audio begins playback.
@@ -1584,8 +1688,14 @@
 
     function stopSplitScreen() {
         savePanelPrefs();
-        teardownPanels();
+        // Flip active BEFORE teardown so any plugin destroy() that reads
+        // isActive() during teardownPanels treats itself as transitioning
+        // back to the main-player path. Notify listeners up-front for the
+        // same reason — focus-change handlers should run with the new
+        // (inactive) world view, not the old.
         active = false;
+        _emitFocusChange();
+        teardownPanels();
         setRedundantControlsHidden(false);
         restoreHud();
 
