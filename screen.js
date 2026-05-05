@@ -1146,13 +1146,18 @@
             else popOutPanel(panel);
         };
 
-        // Populate arrangement dropdown (includes Lyrics, JT, and viz plugin options)
-        populateSelect(panel, arrIndex);
+        // Populate arrangement dropdown (includes Lyrics, JT, and viz plugin options).
+        // Use panel.arrIndex (already resolved from prefs above) so the dropdown
+        // reflects the saved arrangement even when a special-mode restore is
+        // about to fall back to plain 2D — e.g. saved viz pref but the renderer
+        // factory isn't loaded, in which case enterVizMode never runs to correct
+        // the selection.
+        populateSelect(panel, panel.arrIndex);
 
         panel.arrName.textContent = isLyricsMode ? 'Lyrics'
             : isJumpingTabMode ? 'Jumping Tab'
             : (isVizMode && typeof vizFactoryFn === 'function') ? (arrangements[panel.arrIndex]?.name || '') + ' (viz)'
-            : (arrangements[arrIndex]?.name || '');
+            : (arrangements[panel.arrIndex]?.name || '');
 
         panel.select.onchange = () => {
             const val = panel.select.value;
