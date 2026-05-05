@@ -19,7 +19,7 @@
     const STORAGE_KEY = 'splitscreenPanelPrefs';
     const LYRICS_VALUE       = '__lyrics__';
     const JUMPING_TAB_VALUE  = '__jumping_tab__';
-    const HW3D_VALUE         = '__3d_highway__';
+    const VIZ_PREFIX         = '__viz__';
     const DETECT_CHANNEL_CYCLE  = ['mono', 'left', 'right'];
     const DETECT_CHANNEL_LABELS = { mono: 'M', left: 'L', right: 'R' };
 
@@ -32,6 +32,74 @@
     let wrap = null;
     let currentFilename = null;
     let arrangements = []; // arrangement list from song_info
+    let vizPlugins   = []; // {id, name, ...} — type=visualization plugins from /api/plugins
+    let _starting    = false; // re-entrancy guard for startSplitScreen
+    let _pendingRebuild = false; // rebuildLayout requested while a start is in flight
+
+    // Focus model — which panel currently "owns" multi-instance plugin
+    // resources (MIDI input routing for piano, settings-gear placement, etc).
+    // Defaults to panel 0; clicking another panel transfers focus.
+    let focusedPanelIdx = 0;
+    const focusListeners = new Set();
+    function _focusedPanel() {
+        if (!active || !panels.length) return null;
+        if (focusedPanelIdx >= panels.length) focusedPanelIdx = 0;
+        return panels[focusedPanelIdx];
+    }
+    function _emitFocusChange() {
+        for (const fn of focusListeners) {
+            try { fn(); } catch (_) { /* listener errors must not break peers */ }
+        }
+    }
+    function _applyFocusBorder() {
+        for (let i = 0; i < panels.length; i++) {
+            panels[i].panelDiv.style.borderColor = i === focusedPanelIdx ? '#4080e0' : '#333';
+        }
+    }
+    function _setFocusedPanel(idx) {
+        if (idx < 0 || idx >= panels.length) return;
+        if (idx === focusedPanelIdx) return;
+        focusedPanelIdx = idx;
+        _applyFocusBorder();
+        _emitFocusChange();
+    }
+    function _findPanelIdxByCanvas(canvas) {
+        if (!canvas) return -1;
+        for (let i = 0; i < panels.length; i++) {
+            if (panels[i].canvas === canvas) return i;
+        }
+        return -1;
+    }
+
+    let _vizPluginsFetchFailed = false;
+    async function fetchVizPlugins() {
+        try {
+            const resp = await fetch('/api/plugins');
+            const all  = await resp.json();
+            // Store metadata for all viz plugins; factory presence is checked at
+            // populateSelect() time (not at fetch time), so the window['slopsmithViz_*']
+            // globals are evaluated when the dropdown is first built.
+            vizPlugins = (all || []).filter(p => p?.type === 'visualization');
+        } catch (_) {
+            // /api/plugins unavailable — fall back to scanning window for any
+            // slopsmithViz_* factories that are already loaded so viz options
+            // remain available even when the plugin registry can't be fetched.
+            // Mark fetch as failed so populateSelect re-scans on every build,
+            // preserving the "deferred plugin scripts are reflected" property
+            // even without a registry endpoint.
+            _vizPluginsFetchFailed = true;
+            _rescanVizPluginsFromWindow();
+        }
+    }
+    function _rescanVizPluginsFromWindow() {
+        vizPlugins = Object.keys(window)
+            .filter(k => k.startsWith('slopsmithViz_') && typeof window[k] === 'function')
+            .map(k => ({ id: k.slice('slopsmithViz_'.length), name: k.slice('slopsmithViz_'.length) }));
+    }
+    // Keep the promise so startSplitScreen / loadSongInFollower can await it —
+    // panels are never populated before the list is ready even on a fast first
+    // interaction.
+    const _vizPluginsReady = fetchVizPlugins();
 
     // ══════════════════════════════════════════════════════════════════════
     //  Pop-out / follower-mode (multi-monitor support).
@@ -57,14 +125,17 @@
             const params = new URLSearchParams(window.location.search);
             if (params.get('ssFollower') !== '1') return null;
             const cfg = {
-                popupId:         params.get('popupId') || '',
-                filename:        params.get('filename') || '',
-                arrangement:     parseInt(params.get('arrangement'), 10) || 0,
-                mode:            params.get('mode') || '2d',
-                inverted:        params.get('inverted') === '1',
-                mastery:         parseFloat(params.get('mastery')),
-                palette:         params.get('palette') || '',
-                cameraSmoothing: parseFloat(params.get('cameraSmoothing')),
+                popupId:       params.get('popupId') || '',
+                filename:      params.get('filename') || '',
+                arrangement:   parseInt(params.get('arrangement'), 10) || 0,
+                mode:          params.get('mode') || '2d',
+                inverted:      params.get('inverted') === '1',
+                mastery:       parseFloat(params.get('mastery')),
+                // User-driven per-panel toggles forwarded by the spawning
+                // window so the popup mirrors the source panel's state.
+                lyrics:        params.get('lyrics') === '1',
+                barHidden:     params.get('barHidden') === '1',
+                detectChannel: params.get('detectChannel') || 'mono',
             };
             if (!cfg.filename) return null;
             return cfg;
@@ -86,12 +157,51 @@
     // by panel index, and calls panelIndexFor(canvas) to resolve which panel
     // a canvas belongs to).
     window.slopsmithSplitscreen = {
+        // Active state — false during normal main-player operation. Plugins
+        // gate their splitscreen-aware code paths on this so they fall back
+        // to the single-instance main-player path when the user isn't split.
+        isActive() { return active; },
+
+        // Identify a panel by the highway canvas its renderer received in init().
         panelIndexFor(canvas) {
             if (!active) return null;
-            for (let i = 0; i < panels.length; i++) {
-                if (panels[i].canvas === canvas) return i;
-            }
-            return null;
+            const i = _findPanelIdxByCanvas(canvas);
+            return i === -1 ? null : i;
+        },
+
+        // Container element for per-panel chrome/overlays. Plugins that mount
+        // their own DOM (piano overlay canvas, drums HUD) anchor against this
+        // so the overlay sizes to the panel rect, not the whole #player.
+        panelChromeFor(canvas) {
+            if (!active) return null;
+            const i = _findPanelIdxByCanvas(canvas);
+            return i === -1 ? null : panels[i].panelDiv;
+        },
+
+        // Anchor for per-panel settings buttons (e.g. piano gear button).
+        // The mini control bar is the natural place — already visible, already
+        // panel-scoped, already used for invert/lyrics/tab/detect toggles.
+        settingsAnchorFor(canvas) {
+            if (!active) return null;
+            const i = _findPanelIdxByCanvas(canvas);
+            return i === -1 ? null : panels[i].bar;
+        },
+
+        // True when this canvas's panel is the focused one. Plugins use this
+        // to route shared input (e.g. MIDI keyboard) to a single instance.
+        isCanvasFocused(canvas) {
+            if (!active) return true; // no panels => main-player single instance
+            const i = _findPanelIdxByCanvas(canvas);
+            if (i === -1) return false;
+            if (focusedPanelIdx >= panels.length) focusedPanelIdx = 0;
+            return i === focusedPanelIdx;
+        },
+
+        onFocusChange(fn) {
+            if (typeof fn === 'function') focusListeners.add(fn);
+        },
+        offFocusChange(fn) {
+            focusListeners.delete(fn);
         },
     };
 
@@ -138,10 +248,10 @@
         const prefs = panels.map(p => ({
             arrName: p.jumpingTabMode
                 ? JUMPING_TAB_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
-                : p.hw3dMode
-                ? HW3D_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
+                : p.vizMode
+                ? VIZ_PREFIX + ':' + p.vizMode + ':' + (arrangements[p.arrIndex]?.name || '')
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
-            lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
+            lyrics: !!p.lyricsOverlayOn,
             inverted: p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
             barHidden: p.bar.style.display === 'none',
@@ -158,8 +268,42 @@
         }
     }
 
+    // Migration version marker so one-time resets (e.g. the lyrics-overlay
+    // semantics flip) only run on prefs written by older code. Without this
+    // gate, a per-load migration would clobber the user's actual toggle
+    // state every reload — the overlay-on choice could never persist.
+    const PREFS_MIGRATION_KEY = 'splitscreenPrefsMigrationV';
+    const PREFS_CURRENT_V = 2;
+
+    function migratePanelPrefs(prefs) {
+        if (!Array.isArray(prefs)) return prefs;
+        let v = 0;
+        try { v = parseInt(localStorage.getItem(PREFS_MIGRATION_KEY) || '0', 10) || 0; }
+        catch (_) {}
+        const needsLyricsReset = v < 2;
+        const out = prefs.map(p => {
+            const next = { ...p };
+            // v < 2: previous `lyrics` field tracked highway's built-in
+            // setLyricsVisible (defaulted to true). The new overlay-driven
+            // toggle inherits that field, so existing users would otherwise
+            // see overlay-on everywhere on first load. Reset once; from then
+            // on the user-driven value round-trips normally.
+            if (needsLyricsReset) next.lyrics = false;
+            // Legacy 3D-Highway sentinel migration (pre-PR-36).
+            if (next.arrName?.startsWith('__3d_highway__:')) {
+                next.arrName = VIZ_PREFIX + ':highway_3d:' + next.arrName.slice('__3d_highway__:'.length);
+            }
+            return next;
+        });
+        if (v < PREFS_CURRENT_V) {
+            try { localStorage.setItem(PREFS_MIGRATION_KEY, String(PREFS_CURRENT_V)); }
+            catch (_) {}
+        }
+        return out;
+    }
+
     function resolveArrIndex(arrName) {
-        if (!arrName || arrName === LYRICS_VALUE || arrName.startsWith(JUMPING_TAB_VALUE) || arrName.startsWith(HW3D_VALUE)) return -1;
+        if (!arrName || arrName === LYRICS_VALUE || arrName.startsWith(JUMPING_TAB_VALUE) || arrName.startsWith(VIZ_PREFIX + ':')) return -1;
         const lower = arrName.toLowerCase();
         for (let i = 0; i < arrangements.length; i++) {
             if ((arrangements[i].name || '').toLowerCase() === lower) return i;
@@ -199,13 +343,25 @@
     //  Lyrics-only pane renderer
     // ══════════════════════════════════════════════════════════════════════
 
-    function createLyricsPane(container) {
+    function createLyricsPane(container, opts) {
+        const overlay = !!(opts && opts.overlay);
         const el = document.createElement('div');
-        el.className = 'splitscreen-lyrics-pane';
-        el.style.cssText =
-            'position:absolute;top:0;left:0;right:0;bottom:0;' +
-            'display:flex;flex-direction:column;justify-content:center;align-items:center;' +
-            'background:#08080e;padding:24px;overflow:hidden;';
+        el.className = overlay ? 'splitscreen-lyrics-overlay' : 'splitscreen-lyrics-pane';
+        // Overlay mode: top-anchored translucent band that floats above
+        // whatever renderer owns the canvas (default 2D, piano, drums, 3D
+        // Highway, ...). z-index 9 sits above bar (7) and barToggleBtn (8)
+        // so lyrics are always on top regardless of viz. pointer-events:none
+        // so toggles/clicks under it (including the canvas) still work.
+        // Full-pane mode: opaque, fills the panel — used for lyrics-only
+        // mode (canvas hidden), unchanged from before.
+        el.style.cssText = overlay
+            ? 'position:absolute;top:0;left:0;right:0;height:auto;' +
+              'display:flex;flex-direction:column;justify-content:center;align-items:center;' +
+              'background:rgba(8,8,16,0.78);padding:10px 16px;overflow:hidden;' +
+              'pointer-events:none;z-index:9;'
+            : 'position:absolute;top:0;left:0;right:0;bottom:0;' +
+              'display:flex;flex-direction:column;justify-content:center;align-items:center;' +
+              'background:#08080e;padding:24px;overflow:hidden;';
         container.appendChild(el);
 
         let lyrics = [];
@@ -324,13 +480,17 @@
             el.innerHTML = '';
 
             const curDiv = document.createElement('div');
-            curDiv.style.cssText = 'font-size:clamp(20px, 4vw, 48px);font-weight:600;text-align:center;line-height:1.4;transition:opacity 0.3s;';
+            curDiv.style.cssText = overlay
+                ? 'font-size:clamp(14px, 2vw, 22px);font-weight:600;text-align:center;line-height:1.3;transition:opacity 0.3s;'
+                : 'font-size:clamp(20px, 4vw, 48px);font-weight:600;text-align:center;line-height:1.4;transition:opacity 0.3s;';
             curDiv.appendChild(renderLine(currentLine, t));
             el.appendChild(curDiv);
 
             if (nextLine && gapToNext <= 4.0) {
                 const nextDiv = document.createElement('div');
-                nextDiv.style.cssText = 'font-size:clamp(16px, 3vw, 36px);font-weight:400;text-align:center;line-height:1.4;margin-top:16px;color:#444;';
+                nextDiv.style.cssText = overlay
+                    ? 'font-size:clamp(11px, 1.5vw, 17px);font-weight:400;text-align:center;line-height:1.3;margin-top:4px;color:#444;'
+                    : 'font-size:clamp(16px, 3vw, 36px);font-weight:400;text-align:center;line-height:1.4;margin-top:16px;color:#444;';
                 nextDiv.appendChild(renderLine(nextLine, t));
                 el.appendChild(nextDiv);
             }
@@ -415,7 +575,7 @@
             'position:absolute;bottom:0;left:0;right:0;' +
             'display:flex;align-items:center;gap:10px;padding:4px 8px;' +
             'flex-wrap:nowrap;overflow:hidden;' +
-            'background:rgba(8,8,16,0.85);z-index:5;';
+            'background:rgba(8,8,16,0.85);z-index:7;';
 
         // Panel label
         const label = document.createElement('span');
@@ -559,7 +719,7 @@
 
         const barToggleBtn = document.createElement('button');
         barToggleBtn.style.cssText =
-            'position:absolute;bottom:0;right:0;z-index:6;' +
+            'position:absolute;bottom:0;right:0;z-index:8;' +
             'display:flex;align-items:center;justify-content:center;' +
             'padding:2px 6px;border-radius:4px 0 0 0;cursor:pointer;' +
             'background:rgba(64,128,224,0.85);border:none;' +
@@ -567,6 +727,15 @@
         barToggleBtn.textContent = '▾ Bar';
         barToggleBtn.title = 'Hide panel controls';
         panelDiv.appendChild(barToggleBtn);
+
+        // Click-to-focus. Pointerdown (capture) so it fires before any inner
+        // control swallows the event. Resolves the panel by index at fire
+        // time — `panels` is rebuilt by rebuildLayout, so the closure can't
+        // capture a stable panel reference here.
+        panelDiv.addEventListener('pointerdown', () => {
+            const i = panels.findIndex(p => p.panelDiv === panelDiv);
+            if (i !== -1) _setFocusedPanel(i);
+        }, true);
 
         container.appendChild(panelDiv);
 
@@ -610,12 +779,25 @@
     // can fire after the arrays are cleared, leaking the previous chart's data
     // into the new arrangement. Replacing the highway instance entirely orphans
     // the old closure so late messages can't pollute the new chart.
-    function recreatePanelHighway(panel) {
+    function recreatePanelHighway(panel, opts) {
         const old = panel.hw;
         const inverted = old.getInverted();
         const lyricsVisible = typeof old.getLyricsVisible === 'function' ? old.getLyricsVisible() : true;
         const mastery = old.getMastery();
         old.stop();
+
+        // Replace the canvas element so the new renderer can acquire its
+        // context type on a FRESH canvas. Browsers permanently lock a canvas
+        // to its first context type — a canvas that previously got
+        // getContext('2d') silently returns null for getContext('webgl'),
+        // and vice versa. Reusing the old canvas across renderer types
+        // would break WebGL viz plugins on 2D↔viz and viz↔viz arrangement
+        // switches; replacing the element sidesteps the lock entirely.
+        const oldCanvas = panel.canvas;
+        const newCanvas = document.createElement('canvas');
+        newCanvas.style.cssText = oldCanvas.style.cssText || 'width:100%;height:100%;display:block;';
+        oldCanvas.replaceWith(newCanvas);
+        panel.canvas = newCanvas;
 
         const hw = createHighway();
         hw.resize = function () {
@@ -631,6 +813,12 @@
             c.width = Math.round(w * scale);
             c.height = Math.round(h * scale);
         };
+        // Pre-install the renderer BEFORE hw.init so the canvas locks to the
+        // correct context type (e.g. WebGL for 3D Highway) on first init.
+        // Same restore-on-load technique used by initPanel for saved viz prefs.
+        if (opts?.preInstallRenderer) {
+            hw.setRenderer(opts.preInstallRenderer);
+        }
         hw.init(panel.canvas);
         hw.setInverted(inverted);
         if (typeof hw.setLyricsVisible === 'function') hw.setLyricsVisible(lyricsVisible);
@@ -732,6 +920,12 @@
 
     // ── Panel lifecycle ──
     function populateSelect(panel, arrIndex) {
+        // If /api/plugins fetch failed earlier, re-scan window for viz
+        // factories every time the dropdown is built — covers viz plugin
+        // scripts that load asynchronously after splitscreen first opened.
+        // No-op when the registry fetch succeeded (vizPlugins is the
+        // authoritative metadata list including names that aren't on window).
+        if (_vizPluginsFetchFailed) _rescanVizPluginsFromWindow();
         panel.select.innerHTML = '';
         arrangements.forEach((a, i) => {
             const opt = document.createElement('option');
@@ -756,15 +950,15 @@
             });
         }
 
-        if (typeof window.slopsmithViz_highway_3d === 'function') {
+        vizPlugins.filter(vp => typeof window['slopsmithViz_' + vp.id] === 'function').forEach(vp => {
             arrangements.forEach((a, i) => {
                 const opt = document.createElement('option');
-                opt.value = HW3D_VALUE + ':' + i;
-                opt.textContent = (a.name || `Arr ${i}`) + ' (3D)';
-                if (panel.hw3dMode && panel.arrIndex === i) opt.selected = true;
+                opt.value = VIZ_PREFIX + ':' + vp.id + ':' + i;
+                opt.textContent = (a.name || `Arr ${i}`) + ' (' + (vp.name || vp.id) + ')';
+                if (panel.vizMode === vp.id && panel.arrIndex === i) opt.selected = true;
                 panel.select.appendChild(opt);
             });
-        }
+        });
     }
 
     function enterLyricsMode(panel) {
@@ -885,8 +1079,8 @@
         savePanelPrefs();
     }
 
-    function enter3DHwMode(panel) {
-        if (panel.hw3dMode) return;
+    function enterVizMode(panel, pluginId, rendererPreInstalled) {
+        if (panel.vizMode) return;
 
         if (panel.lyricsMode) exitLyricsMode(panel, panel.arrIndex);
         if (panel.jumpingTabMode) exitJumpingTabMode(panel, panel.arrIndex);
@@ -895,14 +1089,32 @@
         panel.tabBtn.style.display = 'none';
         panel.viewBtn.style.display = 'none';
 
-        // Hand the panel's existing highway a 3D renderer, then connect so
-        // the highway's WebSocket and RAF loop start feeding draw(bundle) calls.
-        panel.hw.setRenderer(window.slopsmithViz_highway_3d());
+        // Skip setRenderer when the caller already installed the renderer
+        // before hw.init (restore-on-load path) to avoid creating a redundant
+        // renderer instance and to respect the canvas context-type lock order.
+        if (!rendererPreInstalled) {
+            // Build the renderer instance FIRST so a throwing factory
+            // doesn't tear down the highway / canvas before we know it
+            // works. On throw, restore the buttons we just hid and bail
+            // — panel keeps its previous (now-2D-after-exit*) highway.
+            let newRenderer;
+            try {
+                newRenderer = window['slopsmithViz_' + pluginId]();
+            } catch (e) {
+                console.error('[splitscreen] viz factory threw for', pluginId, '— staying in 2D:', e);
+                panel.tabBtn.style.display = '';
+                return;
+            }
+            // Recreate the highway with a fresh canvas + the viz renderer
+            // pre-installed so the canvas locks to the renderer's context
+            // type (WebGL for 3D Highway, 2D for piano/drums) on first init.
+            // Without the pre-install, recreatePanelHighway's hw.init would
+            // try the default 2D context and silently break WebGL viz.
+            recreatePanelHighway(panel, { preInstallRenderer: newRenderer });
+        }
         hookPanelReady(panel);
         panel.hw.connect(getWsUrl(currentFilename, panel.arrIndex), { onSongInfo: () => {} });
-        panel.hw3dMode = true;
-        showPaletteSelect(panel);
-        showCamSmoothing(panel);
+        panel.vizMode = pluginId;
 
         panel.updateInvertStyle(panel.hw.getInverted());
         panel.invertBtn.onclick = () => {
@@ -912,20 +1124,21 @@
             savePanelPrefs();
         };
 
-        panel.select.value = HW3D_VALUE + ':' + panel.arrIndex;
-        panel.arrName.textContent = (arrangements[panel.arrIndex]?.name || '') + ' (3D)';
+        const vp = vizPlugins.find(p => p.id === pluginId);
+        panel.select.value = VIZ_PREFIX + ':' + pluginId + ':' + panel.arrIndex;
+        panel.arrName.textContent = (arrangements[panel.arrIndex]?.name || '') + ' (' + (vp?.name || pluginId) + ')';
         savePanelPrefs();
     }
 
-    function exit3DHwMode(panel, arrIndex) {
-        if (!panel.hw3dMode) return;
+    function exitVizMode(panel, arrIndex) {
+        if (!panel.vizMode) return;
 
-        // Revert to the default highway renderer — calls destroy() on the 3D
-        // renderer which restores the 2D canvas display automatically.
+        // Clear the renderer first so it can release its resources (WebGL
+        // context, event listeners) via its own cleanup path, then recreate
+        // the highway to give the fresh 2D renderer a clean canvas.
         panel.hw.setRenderer(null);
-        panel.hw3dMode = false;
-        hidePaletteSelect(panel);
-        hideCamSmoothing(panel);
+        recreatePanelHighway(panel);
+        panel.vizMode = null;
 
         panel.tabBtn.style.display = '';
 
@@ -948,29 +1161,55 @@
     function initPanel(panel, arrIndex, prefs) {
         const isLyricsMode = prefs?.arrName === LYRICS_VALUE;
         const isJumpingTabMode = prefs?.arrName?.startsWith(JUMPING_TAB_VALUE) || false;
-        const is3DMode = prefs?.arrName?.startsWith(HW3D_VALUE) || false;
+        const isVizMode = prefs?.arrName?.startsWith(VIZ_PREFIX + ':') || false;
+        let savedVizPluginId = null;
         if (isJumpingTabMode) {
             const jtArrName = prefs.arrName.slice(JUMPING_TAB_VALUE.length + 1);
             const jtIdx = resolveArrIndex(jtArrName);
             panel.arrIndex = jtIdx >= 0 ? jtIdx : arrIndex;
-        } else if (is3DMode) {
-            const d3ArrName = prefs.arrName.slice(HW3D_VALUE.length + 1);
-            const d3Idx = resolveArrIndex(d3ArrName);
-            panel.arrIndex = d3Idx >= 0 ? d3Idx : arrIndex;
+        } else if (isVizMode) {
+            const parts = prefs.arrName.split(':');
+            savedVizPluginId = parts[1];
+            const vizArrName = parts.slice(2).join(':');
+            const vizIdx = resolveArrIndex(vizArrName);
+            panel.arrIndex = vizIdx >= 0 ? vizIdx : arrIndex;
         } else {
             panel.arrIndex = isLyricsMode ? 0 : arrIndex;
         }
         panel.lyricsMode = false;
         panel.lyricsPane = null;
+        panel.lyricsOverlay = null;
+        panel.lyricsOverlayOn = false;
         panel.jumpingTabMode = false;
         panel.jumpingTabPane = null;
         panel.jumpingTabContainer = null;
-        panel.hw3dMode = false;
+        panel.vizMode = null;
+
+        // For viz restore: install the renderer BEFORE hw.init so the canvas
+        // context is locked to the correct type (2D vs WebGL) on first init.
+        // See CLAUDE.md "Canvas context-type lock" caveat.
+        const vizFactoryFn = isVizMode && savedVizPluginId
+            ? window['slopsmithViz_' + savedVizPluginId]
+            : null;
+        // Guard the factory call. A buggy viz plugin throwing here would
+        // bubble out of initPanel and abort the entire splitscreen start
+        // (caught only by startSplitScreen's catch — every panel torn down
+        // because one viz factory threw). Fall back to default 2D for just
+        // this panel instead.
+        let vizInstalled = false;
+        if (typeof vizFactoryFn === 'function') {
+            try {
+                panel.hw.setRenderer(vizFactoryFn());
+                vizInstalled = true;
+            } catch (e) {
+                console.error('[splitscreen] viz factory threw for', savedVizPluginId, '— falling back to 2D for panel:', e);
+            }
+        }
 
         panel.hw.init(panel.canvas);
 
         // Apply saved preferences
-        if (prefs && !isLyricsMode && !isJumpingTabMode && !is3DMode) {
+        if (prefs && !isLyricsMode && !isJumpingTabMode && !isVizMode) {
             if (prefs.inverted !== undefined) panel.hw.setInverted(prefs.inverted);
             if (prefs.lyrics !== undefined && typeof panel.hw.setLyricsVisible === 'function') {
                 panel.hw.setLyricsVisible(prefs.lyrics);
@@ -1009,13 +1248,18 @@
             else popOutPanel(panel);
         };
 
-        // Populate arrangement dropdown (includes Lyrics, JT, and 3D options)
-        populateSelect(panel, arrIndex);
+        // Populate arrangement dropdown (includes Lyrics, JT, and viz plugin options).
+        // Use panel.arrIndex (already resolved from prefs above) so the dropdown
+        // reflects the saved arrangement even when a special-mode restore is
+        // about to fall back to plain 2D — e.g. saved viz pref but the renderer
+        // factory isn't loaded, in which case enterVizMode never runs to correct
+        // the selection.
+        populateSelect(panel, panel.arrIndex);
 
         panel.arrName.textContent = isLyricsMode ? 'Lyrics'
             : isJumpingTabMode ? 'Jumping Tab'
-            : is3DMode ? (arrangements[panel.arrIndex]?.name || '') + ' (3D)'
-            : (arrangements[arrIndex]?.name || '');
+            : (isVizMode && vizInstalled) ? (arrangements[panel.arrIndex]?.name || '') + ' (viz)'
+            : (arrangements[panel.arrIndex]?.name || '');
 
         panel.select.onchange = () => {
             const val = panel.select.value;
@@ -1030,17 +1274,36 @@
                     panel.jumpingTabMode = false;
                 }
                 enterJumpingTabMode(panel);
-            } else if (val.startsWith(HW3D_VALUE + ':')) {
-                const d3Idx = parseInt(val.split(':')[1]);
-                panel.arrIndex = d3Idx;
-                if (panel.hw3dMode) {
-                    // Already in 3D — recreate hw to avoid the old WS leaking
-                    // notes from the previous arrangement into the new one.
-                    recreatePanelHighway(panel);
-                    panel.hw.setRenderer(window.slopsmithViz_highway_3d());
+            } else if (val.startsWith(VIZ_PREFIX + ':')) {
+                const parts    = val.split(':');
+                const pluginId = parts[1];
+                const vizIdx   = parseInt(parts[2]);
+                panel.arrIndex = vizIdx;
+                if (panel.vizMode) {
+                    // Build the new renderer first so a throwing factory
+                    // doesn't leave the panel half-torn-down. On throw,
+                    // fall through to a default 2D highway for vizIdx so
+                    // the panel still has a working chart.
+                    let newRenderer;
+                    try {
+                        newRenderer = window['slopsmithViz_' + pluginId]();
+                    } catch (e) {
+                        console.error('[splitscreen] viz factory threw for', pluginId, '— falling back to 2D:', e);
+                        exitVizMode(panel, vizIdx);
+                        return;
+                    }
+                    // Clear the current renderer so it can release its
+                    // resources (WebGL context, event listeners), then
+                    // recreate the highway with the new renderer pre-installed
+                    // — the fresh canvas locks to the new context type, and
+                    // the orphaned old WS can't leak notes into the new chart.
+                    panel.hw.setRenderer(null);
+                    recreatePanelHighway(panel, { preInstallRenderer: newRenderer });
                     hookPanelReady(panel);
-                    panel.hw.connect(getWsUrl(currentFilename, d3Idx), { onSongInfo: () => {} });
-                    panel.arrName.textContent = (arrangements[d3Idx]?.name || '') + ' (3D)';
+                    panel.hw.connect(getWsUrl(currentFilename, vizIdx), { onSongInfo: () => {} });
+                    panel.vizMode = pluginId;
+                    const vp = vizPlugins.find(p => p.id === pluginId);
+                    panel.arrName.textContent = (arrangements[vizIdx]?.name || '') + ' (' + (vp?.name || pluginId) + ')';
                     // Re-bind invert handler on the fresh hw
                     panel.updateInvertStyle(panel.hw.getInverted());
                     panel.invertBtn.onclick = () => {
@@ -1051,7 +1314,7 @@
                     };
                     savePanelPrefs();
                 } else {
-                    enter3DHwMode(panel);
+                    enterVizMode(panel, pluginId);
                 }
             } else if (val === LYRICS_VALUE) {
                 enterLyricsMode(panel);
@@ -1059,8 +1322,8 @@
                 const newIdx = parseInt(val);
                 if (panel.jumpingTabMode) {
                     exitJumpingTabMode(panel, newIdx);
-                } else if (panel.hw3dMode) {
-                    exit3DHwMode(panel, newIdx);
+                } else if (panel.vizMode) {
+                    exitVizMode(panel, newIdx);
                 } else if (panel.lyricsMode) {
                     exitLyricsMode(panel, newIdx);
                 } else {
@@ -1079,21 +1342,40 @@
             savePanelPrefs();
         };
 
-        // Per-panel lyrics toggle (uses highway factory's per-instance showLyrics)
-        const hasLyricsApi = typeof panel.hw.setLyricsVisible === 'function';
-        if (hasLyricsApi) {
-            panel.updateLyricsStyle(panel.hw.getLyricsVisible());
-            panel.lyricsBtn.onclick = () => {
-                const on = !panel.hw.getLyricsVisible();
+        // Per-panel lyrics toggle. Always renders a transparent overlay band
+        // anchored to top of the panel (z-index above bar + viz renderers),
+        // so it works regardless of which renderer (2D, piano, drums, 3D
+        // Highway, future viz) owns the canvas. Future-proof: any new viz
+        // plugin gets lyric support for free without modification.
+        // Also keeps the highway's built-in setLyricsVisible (in-canvas
+        // underline cue) in sync — complementary to the overlay text.
+        panel.lyricsOverlayOn = prefs?.lyrics === true;
+        const _toggleLyricsOverlay = (on) => {
+            if (on) {
+                if (panel.lyricsOverlay) panel.lyricsOverlay.destroy();
+                panel.lyricsOverlay = createLyricsPane(panel.panelDiv, { overlay: true });
+                // Connect with arrangement 0 — lyrics are song-level (same
+                // across arrangements) and this matches enterLyricsMode's
+                // full-pane connect, so the overlay doesn't need to
+                // reconnect when the user switches arrangement on the panel.
+                panel.lyricsOverlay.connect(currentFilename, 0);
+            } else if (panel.lyricsOverlay) {
+                panel.lyricsOverlay.destroy();
+                panel.lyricsOverlay.el.remove();
+                panel.lyricsOverlay = null;
+            }
+            if (typeof panel.hw.setLyricsVisible === 'function') {
                 panel.hw.setLyricsVisible(on);
-                panel.updateLyricsStyle(on);
-                savePanelPrefs();
-            };
-        } else {
-            panel.lyricsBtn.disabled = true;
-            panel.lyricsBtn.title = 'Highway lyrics API not available';
-            panel.lyricsBtn.style.opacity = '0.4';
-        }
+            }
+            panel.updateLyricsStyle(on);
+        };
+        if (panel.lyricsOverlayOn) _toggleLyricsOverlay(true);
+        else panel.updateLyricsStyle(false);
+        panel.lyricsBtn.onclick = () => {
+            panel.lyricsOverlayOn = !panel.lyricsOverlayOn;
+            _toggleLyricsOverlay(panel.lyricsOverlayOn);
+            savePanelPrefs();
+        };
 
         // Per-panel Highway/Tab mode toggle (uses tabview factory)
         const hasTabFactory = typeof window.createTabView === 'function';
@@ -1125,8 +1407,12 @@
             enterLyricsMode(panel);
         } else if (isJumpingTabMode) {
             enterJumpingTabMode(panel);
-        } else if (is3DMode) {
-            enter3DHwMode(panel);
+        } else if (isVizMode && vizInstalled) {
+            // Renderer was already installed before hw.init above; pass true to
+            // skip the redundant setRenderer call inside enterVizMode. If the
+            // factory threw earlier (vizInstalled=false), fall through to the
+            // plain-2D else-branch so the panel still gets a working highway.
+            enterVizMode(panel, savedVizPluginId, /* rendererPreInstalled */ true);
         } else {
             // Connect WebSocket. Pass an empty onSongInfo so core skips its
             // default writes to shared HUD / audio / arrangement dropdown
@@ -1234,6 +1520,16 @@
     }
 
     function teardownPanels() {
+        // Flip active + notify focus listeners up-front. All callers
+        // (stopSplitScreen, rebuildLayout, popOutPanel, _redockPanel) need
+        // active=false so a follow-up startSplitScreen() passes its
+        // `_starting || active` re-entrancy guard. Centralising the flip
+        // here removes the foot-gun of every restart path remembering to
+        // clear it manually. Plugin destroy() handlers below run against
+        // the inactive world view, which is what they expect when they
+        // read isActive() during cleanup.
+        active = false;
+        _emitFocusChange();
         for (const p of panels) {
             if (p.detector) {
                 p.detector.destroy();
@@ -1243,13 +1539,18 @@
                 p.lyricsPane.destroy();
                 p.lyricsPane = null;
             }
+            if (p.lyricsOverlay) {
+                p.lyricsOverlay.destroy();
+                p.lyricsOverlay.el.remove();
+                p.lyricsOverlay = null;
+            }
             if (p.jumpingTabPane) {
                 p.jumpingTabPane.destroy();
                 p.jumpingTabPane = null;
             }
-            if (p.hw3dMode) {
+            if (p.vizMode) {
                 p.hw.setRenderer(null);
-                p.hw3dMode = false;
+                p.vizMode = null;
             }
             if (p.tabInstance) {
                 try { p.tabInstance.destroy(); } catch (_) {}
@@ -1271,30 +1572,39 @@
     function _captureMode(panel) {
         if (panel.lyricsMode) return 'lyrics';
         if (panel.jumpingTabMode) return 'jt';
-        if (panel.hw3dMode) return '3d';
+        if (panel.vizMode) return 'viz:' + panel.vizMode;
         return '2d';
     }
 
-    function _captureFollowerConfig(panel, panelIdx) {
-        const cfg = {
+    // Decode a captured panel mode into the saved-prefs `arrName` form.
+    // Shared by _redockPanel and _followerCfgToPrefs so the popup-and-back
+    // round-trip produces the same prefs the main-window flow would.
+    //
+    // Legacy: pre-PR-36 popups encoded 3D Highway as cfg.mode === '3d'
+    // rather than 'viz:highway_3d'. Map it explicitly so a popup that was
+    // opened on an older build and is now docking back lands on the
+    // correct renderer instead of silently falling back to 2D.
+    function _modeToArrName(mode, arrNameStr) {
+        if (mode === 'lyrics') return LYRICS_VALUE;
+        if (mode === 'jt') return JUMPING_TAB_VALUE + ':' + arrNameStr;
+        if (mode === '3d') return VIZ_PREFIX + ':highway_3d:' + arrNameStr;
+        if (mode?.startsWith('viz:')) return VIZ_PREFIX + ':' + mode.slice(4) + ':' + arrNameStr;
+        return arrNameStr;
+    }
+
+    function _captureFollowerConfig(panel) {
+        return {
             arrangement: panel.arrIndex || 0,
             mode:        _captureMode(panel),
             inverted:    panel.hw.getInverted() ? 1 : 0,
             mastery:     panel.hw.getMastery(),
+            // User-driven per-panel toggles that should survive a pop-out /
+            // dock round-trip. Without these, docking always forces lyrics on
+            // and bar visible regardless of pre-popout state.
+            lyrics:        !!panel.lyricsOverlayOn,
+            barHidden:     panel.bar?.style.display === 'none',
+            detectChannel: panel.detectChannel || 'mono',
         };
-        // 3D-only settings — read the per-panel localStorage values that the
-        // splitscreen UI writes via _writePanelPalette / _writePanelCameraSmoothing.
-        try {
-            const p = localStorage.getItem('h3d_bg_panel' + panelIdx + '_palette')
-                   || localStorage.getItem('h3d_bg_palette');
-            if (p) cfg.palette = p;
-        } catch (_) {}
-        try {
-            const cs = localStorage.getItem('h3d_bg_panel' + panelIdx + '_cameraSmoothing')
-                    || localStorage.getItem('h3d_bg_cameraSmoothing');
-            if (cs != null) cfg.cameraSmoothing = parseFloat(cs);
-        } catch (_) {}
-        return cfg;
     }
 
     function _newPopupId() {
@@ -1316,7 +1626,7 @@
             alert('Pop-out requires a browser that supports BroadcastChannel.');
             return;
         }
-        const cfg = _captureFollowerConfig(panel, idx);
+        const cfg = _captureFollowerConfig(panel);
         const popupId = _newPopupId();
 
         const url = new URL(window.location.origin + '/');
@@ -1327,9 +1637,10 @@
         sp.set('arrangement', String(cfg.arrangement));
         sp.set('mode', cfg.mode);
         sp.set('inverted', String(cfg.inverted));
+        sp.set('lyrics', cfg.lyrics ? '1' : '0');
+        sp.set('barHidden', cfg.barHidden ? '1' : '0');
+        sp.set('detectChannel', cfg.detectChannel || 'mono');
         if (Number.isFinite(cfg.mastery)) sp.set('mastery', String(cfg.mastery));
-        if (cfg.palette) sp.set('palette', cfg.palette);
-        if (Number.isFinite(cfg.cameraSmoothing)) sp.set('cameraSmoothing', String(cfg.cameraSmoothing));
 
         const popup = window.open(url.toString(), popupId, 'popup,width=1280,height=420');
         if (!popup) {
@@ -1353,10 +1664,10 @@
         const savedPrefs = remaining.map(p => ({
             arrName: p.jumpingTabMode
                 ? JUMPING_TAB_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
-                : p.hw3dMode
-                ? HW3D_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
+                : p.vizMode
+                ? VIZ_PREFIX + ':' + p.vizMode + ':' + (arrangements[p.arrIndex]?.name || '')
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
-            lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
+            lyrics: !!p.lyricsOverlayOn,
             inverted: p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
             barHidden: p.bar.style.display === 'none',
@@ -1396,7 +1707,7 @@
                 ch.postMessage({
                     type: 'docked',
                     popupId: FOLLOWER.popupId,
-                    finalState: _captureFollowerConfig(panel, 0),
+                    finalState: _captureFollowerConfig(panel),
                 });
             }
         } catch (_) {}
@@ -1405,6 +1716,14 @@
 
     // ── Main toggle ──
     function rebuildLayout() {
+        // A start is in flight (e.g. user changed the layout select while the
+        // initial start was awaiting _vizPluginsReady). Tearing down now would
+        // race the in-flight panel-build; defer until the start finishes and
+        // its `finally` block re-fires us.
+        if (_starting) {
+            _pendingRebuild = true;
+            return;
+        }
         const wasActive = active;
         const savedPrefs = wasActive ? captureCurrentPrefs() : null;
         teardownPanels();
@@ -1415,10 +1734,10 @@
         return panels.map(p => ({
             arrName: p.jumpingTabMode
                 ? JUMPING_TAB_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
-                : p.hw3dMode
-                ? HW3D_VALUE + ':' + (arrangements[p.arrIndex]?.name || '')
+                : p.vizMode
+                ? VIZ_PREFIX + ':' + p.vizMode + ':' + (arrangements[p.arrIndex]?.name || '')
                 : p.lyricsMode ? LYRICS_VALUE : (arrangements[p.arrIndex]?.name || ''),
-            lyrics: typeof p.hw.getLyricsVisible === 'function' ? p.hw.getLyricsVisible() : true,
+            lyrics: !!p.lyricsOverlayOn,
             inverted: p.hw.getInverted(),
             detectChannel: p.detectChannel || 'mono',
             barHidden: p.bar.style.display === 'none',
@@ -1426,7 +1745,14 @@
         }));
     }
 
-    function startSplitScreen(existingArrangements, savedPrefs) {
+    async function startSplitScreen(existingArrangements, savedPrefs) {
+        // Re-entrancy guard: prevent concurrent starts from double-clicks,
+        // layout rebuilds, or auto-reactivate firing while a start is in flight.
+        if (_starting || active) return;
+        _starting = true;
+        try {
+        await _vizPluginsReady;
+
         const info = highway.getSongInfo();
         if (info && info.arrangements) {
             arrangements = info.arrangements;
@@ -1435,7 +1761,7 @@
 
         // If no explicit arrangements or prefs passed, try loading from storage
         if (!existingArrangements && !savedPrefs) {
-            savedPrefs = loadPanelPrefs();
+            savedPrefs = migratePanelPrefs(loadPanelPrefs());
         }
 
         const cfg = LAYOUTS[layout];
@@ -1456,10 +1782,11 @@
                     const jtArrName = pref.arrName.slice(JUMPING_TAB_VALUE.length + 1);
                     const jtIdx = resolveArrIndex(jtArrName);
                     arrDefaults.push(jtIdx >= 0 ? jtIdx : 0);
-                } else if (pref && pref.arrName?.startsWith(HW3D_VALUE)) {
-                    const d3ArrName = pref.arrName.slice(HW3D_VALUE.length + 1);
-                    const d3Idx = resolveArrIndex(d3ArrName);
-                    arrDefaults.push(d3Idx >= 0 ? d3Idx : 0);
+                } else if (pref && pref.arrName?.startsWith(VIZ_PREFIX + ':')) {
+                    const parts = pref.arrName.split(':');
+                    const vizArrName = parts.slice(2).join(':');
+                    const vizIdx = resolveArrIndex(vizArrName);
+                    arrDefaults.push(vizIdx >= 0 ? vizIdx : 0);
                 } else {
                     const idx = pref ? resolveArrIndex(pref.arrName) : -1;
                     arrDefaults.push(idx >= 0 ? idx : getDefaultArrangements(1)[0]);
@@ -1468,6 +1795,24 @@
         } else {
             arrDefaults = getDefaultArrangements(cfg.panels);
         }
+
+        // Flip active BEFORE the panel-init loop. initPanel may install a
+        // viz renderer (e.g. piano) whose init() calls back into
+        // window.slopsmithSplitscreen.panelChromeFor() / settingsAnchorFor().
+        // Those gate on isActive(); if active flips true only after the loop,
+        // the renderer mounts to #player (main-player fast path) on the first
+        // entry and is stuck full-screen until the next start cycle.
+        active = true;
+        focusedPanelIdx = 0;
+
+        // Size the wrap NOW so panelDivs have a real rect during initPanel.
+        // sizeCanvases() runs at end of start, but viz renderers (piano,
+        // drums) measure panelChrome.clientWidth/Height in their init() —
+        // a wrap with no `bottom` set has height:auto = 0 → panelDiv 50%
+        // of 0 = 0 → renderer's bitmap = 0x0 → CSS upscales = pixelated.
+        const initialControls = document.getElementById('player-controls');
+        const initialControlsH = initialControls ? initialControls.offsetHeight : 0;
+        container.style.bottom = initialControlsH + 'px';
 
         for (let i = 0; i < cfg.panels; i++) {
             const parts = createPanel(i, container, layout);
@@ -1508,7 +1853,10 @@
         }
 
         sizeCanvases();
-        active = true;
+        // Paint focus border + notify any listeners that registered during
+        // the per-panel init pass (piano subscribes from its init()).
+        _applyFocusBorder();
+        _emitFocusChange();
         updateBtn();
         setRedundantControlsHidden(true);
         // HUD: visible while loaded; fades out when audio begins playback.
@@ -1521,12 +1869,52 @@
 
         // Hook into the time sync loop
         startTimeSync();
+        } catch (err) {
+            // Rollback any partial state so the UI doesn't get stuck with
+            // active=true, default highway hidden, and no panels — that's
+            // the worst case (nothing renders, Split button thinks split is
+            // running, toggle is now a no-op). teardownPanels handles the
+            // active flip + plugin destroy; mirror stopSplitScreen for the
+            // rest of the chrome resets so a partially-applied "split mode"
+            // doesn't survive the failure.
+            console.error('startSplitScreen failed:', err);
+            teardownPanels();
+            setRedundantControlsHidden(false);
+            restoreHud();
+            const defaultCanvas = document.getElementById('highway');
+            if (defaultCanvas) defaultCanvas.style.display = '';
+            const controls = document.getElementById('player-controls');
+            if (controls) {
+                if (controlsHidden) controls.style.display = '';
+                controls.style.zIndex = '10';
+                controls.style.marginTop = '';
+            }
+            controlsHidden = false;
+            if (floatBtn) floatBtn.style.display = 'none';
+            updateBtn();
+            stopTimeSync();
+        } finally {
+            _starting = false;
+            // Drain a queued rebuild from rebuildLayout. Only fire if the
+            // session is still active — a failed start above already did
+            // a full teardown, in which case there's nothing to rebuild.
+            if (_pendingRebuild) {
+                _pendingRebuild = false;
+                if (active) rebuildLayout();
+            }
+        }
     }
 
     function stopSplitScreen() {
         savePanelPrefs();
-        teardownPanels();
-        active = false;
+        teardownPanels();  // flips active=false + emits focus change
+        // Defensive clear at full-session-end. Well-behaved plugins
+        // unsubscribe from offFocusChange in their renderer.destroy(),
+        // which runs above as part of teardownPanels. A plugin that
+        // forgets would otherwise accumulate stale callbacks across
+        // sessions; clearing here bounds the leak to the lifetime of
+        // a single split session.
+        focusListeners.clear();
         setRedundantControlsHidden(false);
         restoreHud();
 
@@ -1546,6 +1934,7 @@
     }
 
     function toggle() {
+        if (_starting) return; // treat in-flight start as already active
         if (active) {
             stopSplitScreen();
         } else {
@@ -1634,37 +2023,25 @@
         // active, capture the running prefs and append; otherwise start split
         // fresh with just this one panel.
         const merged = Object.assign({}, entry.originalConfig, finalState || {});
-        const arrName = (merged.mode === 'lyrics') ? LYRICS_VALUE
-            : (merged.mode === 'jt') ? (JUMPING_TAB_VALUE + ':' + (arrangements[merged.arrangement]?.name || ''))
-            : (merged.mode === '3d') ? (HW3D_VALUE + ':' + (arrangements[merged.arrangement]?.name || ''))
-            : (arrangements[merged.arrangement]?.name || '');
+        const arrName = _modeToArrName(merged.mode, arrangements[merged.arrangement]?.name || '');
         const newPrefs = {
             arrName,
-            lyrics: true,
+            // Restore the per-panel toggles captured at pop-out time (and
+            // optionally overlaid with whatever the popup last reported via
+            // finalState) instead of forcing fresh defaults.
+            lyrics: !!merged.lyrics,
             inverted: !!merged.inverted,
-            detectChannel: 'mono',
-            barHidden: false,
+            detectChannel: merged.detectChannel || 'mono',
+            barHidden: !!merged.barHidden,
             mastery: Number.isFinite(merged.mastery) ? merged.mastery : 1,
         };
 
-        // Persist any per-panel 3D settings so the renderer picks them up
-        // when it spins back up. We don't know the slot yet, so we write to
-        // the slot the panel will land in (computed below).
-        let targetIdx;
         let savedPrefs;
         if (active) {
             savedPrefs = captureCurrentPrefs();
-            targetIdx = savedPrefs.length;
             savedPrefs.push(newPrefs);
         } else {
-            targetIdx = 0;
             savedPrefs = [newPrefs];
-        }
-        if (merged.palette) {
-            try { localStorage.setItem('h3d_bg_panel' + targetIdx + '_palette', merged.palette); } catch (_) {}
-        }
-        if (Number.isFinite(merged.cameraSmoothing)) {
-            try { localStorage.setItem('h3d_bg_panel' + targetIdx + '_cameraSmoothing', String(merged.cameraSmoothing)); } catch (_) {}
         }
 
         if (active) {
@@ -2052,18 +2429,6 @@
     // info purposes; per-panel arrangement is set inside each panel's own
     // WebSocket via initPanel.
     async function loadSongInFollower(filename, cfgs) {
-        // Pre-seed per-panel 3D settings (palette, cameraSmoothing) for
-        // every slot BEFORE the renderer first reads them.
-        for (let i = 0; i < cfgs.length; i++) {
-            const cfg = cfgs[i];
-            if (!cfg) continue;
-            if (cfg.palette) {
-                try { localStorage.setItem('h3d_bg_panel' + i + '_palette', cfg.palette); } catch (_) {}
-            }
-            if (Number.isFinite(cfg.cameraSmoothing)) {
-                try { localStorage.setItem('h3d_bg_panel' + i + '_cameraSmoothing', String(cfg.cameraSmoothing)); } catch (_) {}
-            }
-        }
         const firstArr = (cfgs[0] && cfgs[0].arrangement) || 0;
         try {
             await window.playSong(filename, firstArr);
@@ -2077,6 +2442,9 @@
         // should still be in place, but cheap to re-confirm.
         if (_followerAudio) { _followerAudio.muted = true; _followerAudio.volume = 0; }
         await waitForHighwayReady();
+        // Ensure viz plugin metadata is ready before buildFollowerLayout calls
+        // populateSelect() — same guarantee startSplitScreen gives main panels.
+        await _vizPluginsReady;
         // Honour the user's chosen layout (default 'follower' = single).
         // Pad cfgs with null so any extra slots get smart defaults inside
         // buildFollowerLayout.
@@ -2131,16 +2499,17 @@
     // Convert a captured panel config (cfg) and arrIdx into the prefs
     // shape that initPanel expects.
     function _followerCfgToPrefs(cfg, arrIdx) {
-        const arrName = (cfg.mode === 'lyrics') ? LYRICS_VALUE
-            : (cfg.mode === 'jt') ? (JUMPING_TAB_VALUE + ':' + (arrangements[arrIdx]?.name || ''))
-            : (cfg.mode === '3d') ? (HW3D_VALUE + ':' + (arrangements[arrIdx]?.name || ''))
-            : (arrangements[arrIdx]?.name || '');
+        const arrName = _modeToArrName(cfg.mode, arrangements[arrIdx]?.name || '');
         return {
             arrName,
-            lyrics: true,
+            // Use the captured per-panel toggles when present so the follower
+            // window mirrors the source panel's lyrics/bar/detect state.
+            // Older popups that didn't include these fields fall back to
+            // sane defaults.
+            lyrics: !!cfg.lyrics,
             inverted: !!cfg.inverted,
-            detectChannel: 'mono',
-            barHidden: false,
+            detectChannel: cfg.detectChannel || 'mono',
+            barHidden: !!cfg.barHidden,
             mastery: Number.isFinite(cfg.mastery) ? cfg.mastery : 1,
         };
     }
@@ -2319,23 +2688,7 @@
 
         // Capture current panel configs (in slot order) so the rebuilt
         // grid keeps existing arrangement / mode / inverted / mastery.
-        const cfgs = panels.map((p, idx) => {
-            const out = {
-                arrangement: p.arrIndex || 0,
-                mode:        _captureMode(p),
-                inverted:    p.hw.getInverted() ? 1 : 0,
-                mastery:     p.hw.getMastery(),
-            };
-            try {
-                const v = localStorage.getItem('h3d_bg_panel' + idx + '_palette');
-                if (v) out.palette = v;
-            } catch (_) {}
-            try {
-                const v = localStorage.getItem('h3d_bg_panel' + idx + '_cameraSmoothing');
-                if (v != null) out.cameraSmoothing = parseFloat(v);
-            } catch (_) {}
-            return out;
-        });
+        const cfgs = panels.map(p => _captureFollowerConfig(p));
 
         teardownPanels();
         active = false;
@@ -2344,27 +2697,10 @@
 
     // Capture every popup panel's current state into an array of cfgs,
     // suitable for handing back to loadSongInFollower / buildFollowerLayout.
-    // Reads from the live panels (so any user changes since pop-out /
-    // last layout change are honoured) and from per-panel localStorage
-    // (palette + smoothing, in case the user dialled them in the popup).
+    // Reads from the live panels so any user changes since pop-out or
+    // last layout change are honoured.
     function _captureAllFollowerConfigs() {
-        return panels.map((p, idx) => {
-            const out = {
-                arrangement: p.arrIndex || 0,
-                mode:        _captureMode(p),
-                inverted:    p.hw.getInverted() ? 1 : 0,
-                mastery:     p.hw.getMastery(),
-            };
-            try {
-                const v = localStorage.getItem('h3d_bg_panel' + idx + '_palette');
-                if (v) out.palette = v;
-            } catch (_) {}
-            try {
-                const v = localStorage.getItem('h3d_bg_panel' + idx + '_cameraSmoothing');
-                if (v != null) out.cameraSmoothing = parseFloat(v);
-            } catch (_) {}
-            return out;
-        });
+        return panels.map(p => _captureFollowerConfig(p));
     }
 
     // Rebuild the follower panels for a new song while preserving the
@@ -2514,7 +2850,7 @@
                 const arrName = arrangements[p.arrIndex]?.name || 'Arr ' + p.arrIndex;
                 const modeSuffix = p.lyricsMode ? ' (Lyrics)'
                     : p.jumpingTabMode ? ' (JT)'
-                    : p.hw3dMode ? ' (3D)'
+                    : p.vizMode ? ' (' + (vizPlugins.find(vp => vp.id === p.vizMode)?.name || p.vizMode) + ')'
                     : '';
                 return 'P' + (idx + 1) + ': ' + arrName + modeSuffix;
             });

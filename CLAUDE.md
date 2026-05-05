@@ -33,7 +33,7 @@ screen.js
 | `STORAGE_KEY` | `'splitscreenPanelPrefs'` | Per-panel prefs in localStorage |
 | `LYRICS_VALUE` | `'__lyrics__'` | Sentinel for lyrics-only pane in dropdown/prefs |
 | `JUMPING_TAB_VALUE` | `'__jumping_tab__'` | Sentinel for jumping tab pane |
-| `HW3D_VALUE` | `'__3d_highway__'` | Sentinel for 3D highway renderer |
+| `VIZ_PREFIX` | `'__viz__'` | Prefix for generic viz-plugin entries. Select value: `__viz__:<pluginId>:<arrIndex>`; saved pref: `__viz__:<pluginId>:<arrName>` |
 | `DETECT_CHANNEL_CYCLE` | `['mono','left','right']` | Channel cycle order |
 | `DETECT_CHANNEL_LABELS` | `{mono:'M',left:'L',right:'R'}` | Channel button labels |
 
@@ -50,6 +50,7 @@ screen.js
 | `wrap` | element\|null | The `#splitscreen-wrap` div, or null when inactive |
 | `currentFilename` | string\|null | The filename passed to the last `playSong` call |
 | `arrangements` | array | Arrangement list from the last `song_info` WebSocket message |
+| `vizPlugins` | array | `{id, name, …}` entries from `/api/plugins` where `type==='visualization'`. Populated once on page load via `fetchVizPlugins()`. Factory availability (`slopsmithViz_<id>`) is checked lazily in `populateSelect()`, not at fetch time. |
 | `syncInterval` | id\|null | The `setInterval` handle for the time sync loop |
 | `layoutBtn` | element\|null | The layout `<select>` injected into `#player-controls` |
 | `hideBtn` | element\|null | The `▾ Bar` button injected into `#player-controls` |
@@ -69,13 +70,18 @@ screen.js
 
 ```js
 {
-  arrName: string,       // arrangement name, or LYRICS_VALUE / JUMPING_TAB_VALUE:name / HW3D_VALUE:name
-  lyrics: bool,          // per-panel highway lyrics toggle state
+  arrName: string,       // arrangement name, or LYRICS_VALUE / JUMPING_TAB_VALUE:arrName / VIZ_PREFIX:pluginId:arrName
+  lyrics: bool,          // per-panel lyrics overlay toggle (top-anchored translucent band; works in any renderer)
   inverted: bool,        // panel invert state
   detectChannel: string, // 'mono' | 'left' | 'right'
   barHidden: bool,       // whether the panel's mini control bar is hidden
+  mastery: number,       // master-difficulty fraction 0..1 (0=easy, 1=full chart)
 }
 ```
+
+`lyrics` previously tracked the highway's built-in `setLyricsVisible()` (defaulted to true). The semantic switched in PR #36 to drive the panel-owned lyrics overlay (a translucent band layered above whatever renderer owns the canvas). `migratePanelPrefs` force-resets it to `false` once on first read of pre-PR-36 prefs (gated by `splitscreenPrefsMigrationV` localStorage key) so existing users don't inherit overlay-on everywhere.
+
+Old `__3d_highway__:arrName` entries from pre-Wave C builds are migrated to `__viz__:highway_3d:arrName` on read by `migratePanelPrefs()`.
 
 ## Panel object shape
 
@@ -99,7 +105,7 @@ Each entry in `panels[]` is built with `Object.assign({ hw, arrIndex: 0 }, parts
   detectBtn,         // Detect toggle button
   updateDetectStyle, // fn(bool)
   channelBtn,        // M/L/R channel button
-  viewBtn,           // CLS view button (3D only, hidden by default)
+  viewBtn,           // view button (always hidden — vestigial DOM placeholder, not used)
 
   // From startSplitScreen() / initPanel():
   hw,                // highway instance (createHighway())
@@ -109,7 +115,7 @@ Each entry in `panels[]` is built with `Object.assign({ hw, arrIndex: 0 }, parts
   jumpingTabMode,    // bool — showing jumping tab pane
   jumpingTabPane,    // pane object from createJumpingTabPane | null
   jumpingTabContainer, // the container div for the JT pane | null
-  hw3dMode,          // bool — highway using 3D renderer
+  vizMode,           // string|null — plugin id of active viz renderer (e.g. 'highway_3d'), or null
   tabActive,         // bool — tab view overlay shown
   tabInstance,       // createTabView instance | null
   tabContainer,      // the container div for the tab view | null
@@ -147,7 +153,7 @@ stopSplitScreen()
 Each panel is always in exactly one of these modes. Flags are mutually exclusive: entering one exits the others.
 
 ### Normal highway (default)
-- `lyricsMode=false`, `jumpingTabMode=false`, `hw3dMode=false`
+- `lyricsMode=false`, `jumpingTabMode=false`, `vizMode=null`
 - `canvas` is visible, highway runs its default 2D renderer
 - `hw.connect(wsUrl, { onSongInfo: () => {} })` — empty `onSongInfo` prevents clobbering the main player's HUD
 
@@ -164,12 +170,13 @@ Each panel is always in exactly one of these modes. Flags are mutually exclusive
 - `pane.connect(filename, arrIndex)` — async, wrapped in try/catch
 - Invert / Lyrics / Tab buttons hidden
 
-### 3D highway (`hw3dMode=true`)
+### Viz renderer (`vizMode = pluginId string`)
 - Highway NOT stopped — it stays alive with its WebSocket and rAF loop
-- `panel.hw.setRenderer(window.slopsmithViz_highway_3d())` installs the 3D renderer
+- `panel.hw.setRenderer(window['slopsmithViz_' + pluginId]())` installs the renderer
 - `canvas` stays visible (renderer draws to it)
-- Lyrics / Tab buttons hidden; viewBtn shown (cycles 3D view style)
-- To exit: `panel.hw.setRenderer(null)` reverts to default 2D renderer
+- Tab / view buttons hidden; no per-panel settings bar shown (configure via global plugin settings)
+- To exit: `recreatePanelHighway(panel)` discards the viz highway and installs a fresh 2D highway
+- **Canvas context-type lock:** the first `getContext('2d')` or `getContext('webgl')` call on a canvas locks it for its lifetime. Swapping renderers mid-session on the same canvas (e.g. 2D → WebGL → 2D) may not work without re-creating the canvas. The restore-on-load path is safe because `initPanel()` calls `panel.hw.setRenderer(factory())` **before** `hw.init(canvas)` when a viz pref is detected — so the canvas is initialised with the correct context type from the start. For mid-session 2D ↔ viz swaps (and viz-to-viz arrangement switches), `recreatePanelHighway(panel)` is called first to discard the previous highway instance before the new renderer takes over.
 
 ### Tab overlay (`tabActive=true`)
 - Can coexist with normal highway mode (not with lyrics/JT/3D modes)
@@ -249,7 +256,7 @@ The plugin capability-checks all external factories at runtime and gracefully di
 | Factory | Checked via | Used in |
 |---|---|---|
 | `window.createJumpingTabPane` | `typeof === 'function'` | `populateSelect()`, `enterJumpingTabMode()` |
-| `window.slopsmithViz_highway_3d` | `typeof === 'function'` | `populateSelect()`, `enter3DHwMode()` |
+| `window['slopsmithViz_' + id]` | resolved via `fetchVizPlugins()` | `populateSelect()`, `enterVizMode()` — auto-discovered for any `type=visualization` plugin |
 | `window.createTabView` | `typeof === 'function'` | `initPanel()` (wires tabBtn) |
 | `window.createNoteDetector` | `typeof === 'function'` | `initPanel()` (wires detectBtn/channelBtn) |
 
