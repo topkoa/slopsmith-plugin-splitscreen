@@ -964,6 +964,7 @@
     function enterLyricsMode(panel) {
         if (panel.lyricsMode) return;
 
+        if (panel.vizMode) exitVizMode(panel, panel.arrIndex);
         if (panel.jumpingTabMode) exitJumpingTabMode(panel, panel.arrIndex);
         if (panel.tabActive) togglePanelTab(panel);
         panel.hw.stop();
@@ -1016,6 +1017,7 @@
     function enterJumpingTabMode(panel) {
         if (panel.jumpingTabMode) return;
 
+        if (panel.vizMode) exitVizMode(panel, panel.arrIndex);
         if (panel.lyricsMode) exitLyricsMode(panel, panel.arrIndex);
         if (panel.tabActive) togglePanelTab(panel);
         panel.hw.stop();
